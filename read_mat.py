@@ -29,6 +29,7 @@ def read_mat(filename):
                 "B": np.array(current_row[6], dtype=np.float64), 
                 "best": float(current_row[9][0][0]),             
             }
+            
             data_list.append(instance)
         return data_list
     except Exception as e:
