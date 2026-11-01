@@ -1,0 +1,15 @@
+{
+  "model": {"hidden_dim": 16, "message_rounds": 1},
+  "data": {"train_n": [16], "train_m": [3], "capacity_ratios": [0.5], "validation_instances": 4},
+  "train": {
+    "version": "main_g1_smoke", "device": "cpu", "updates": 2,
+    "episodes_per_update": 3, "ppo_epochs": 2, "minibatch_size": 16,
+    "validate_every": 1, "checkpoint_every": 1,
+    "research_question": "Interface and serialization smoke test only; not efficacy evidence"
+  },
+  "eval": {
+    "synthetic_n": [12, 20], "synthetic_m": [2, 4],
+    "synthetic_distributions": ["uncorrelated", "strongly_correlated"],
+    "synthetic_ratios": [0.5], "synthetic_instances_per_group": 1
+  }
+}
