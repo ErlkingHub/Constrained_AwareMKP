@@ -6,7 +6,7 @@ runs/
 results/
 checkpoints/
 .vscode/
-
+cache/
 # C extensions
 *.so
 
