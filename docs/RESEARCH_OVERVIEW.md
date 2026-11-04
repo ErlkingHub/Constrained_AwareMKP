@@ -1,5 +1,7 @@
 # 研究概览：Constrained_AwareMKP
 
+> 历史快照：下文记录 main_v0 的研究背景与既有结果。2026-11-02 的弱解码器 T1 迁移及验证边界见 [WEAK_DECODER_T1_EXECUTION.md](WEAK_DECODER_T1_EXECUTION.md)。
+
 本文面向后续开发人员和 AI 智能体，说明当前项目解决什么问题、采用什么路线，以及代码和本地实验已经支持哪些结论。精确的张量、公式和训练行为见 [ALGORITHM_DESIGN.md](ALGORITHM_DESIGN.md)。
 
 核对日期：2026-10-23；分支：`main_v0`；代码提交：`e7d1def91236ac8bd0e73153a1f4504af695c6bd`。本次核对时已有的业务代码相对该提交没有修改；工作区已有的 `.gitignore` 修改不属于本文工作。以下实现结论以 Python 源码为准，实验结论以所列本地日志和 CSV 为准。源码链接行号对应本次快照，后续优先按类名、函数名定位。

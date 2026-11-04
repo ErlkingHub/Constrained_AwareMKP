@@ -1,5 +1,7 @@
 # 算法设计与实现契约
 
+> 历史快照：下文描述 main_v0 的旧实现。2026-11-02 的弱解码器 T1 迁移见 [WEAK_DECODER_T1_EXECUTION.md](WEAK_DECODER_T1_EXECUTION.md)；当前接口以源码和 README 为准。
+
 本文解释当前代码中的状态、策略参数 θ、固定评分公式、LP 对偶、训练算法以及训练/推理边界，可作为后续开发和 AI 智能体的实现索引。研究定位和已有实验结果见 [RESEARCH_OVERVIEW.md](RESEARCH_OVERVIEW.md)。
 
 核对日期：2026-10-23；分支 `main_v0`；提交 `e7d1def91236ac8bd0e73153a1f4504af695c6bd`。以下是当前实现，不把未来设计当作现有功能。源码行号对应本次快照，后续以符号名定位为准。

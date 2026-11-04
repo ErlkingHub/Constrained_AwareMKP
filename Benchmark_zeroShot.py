@@ -1,43 +1,28 @@
-"""
-Benchmark_zeroShot.py
-=====================
-Zero-shot evaluation of a trained policy on Benchmarks_Chu.mat (never seen in training).
+"""Matched weak-decoder benchmark. Greedy is the primary search-free stage.
 
-For every instance:
-  1. greedy rollout of the policy                         -> gap_greedy
-  2. `num_samples` sampled rollouts (+ greedy), best      -> gap_policy  (pure learned policy)
-  3. optional refinement of the best `ls_pool` distinct
-     policy solutions (mkp_refine: swap / drop-refill / ILS) -> gap_final
-  Reference: static LP-dual ratio greedy (Pirkul / Chu & Beasley)  -> gap_dual_greedy
+--arm fixed,untrained,learned_static,learned_dynamic --checkpoint <dynamic.pt>
+--static_checkpoint <separately-trained-static.pt> --stages greedy,sample64,sample256,greedy+ILS,sampleK+ILS
 
-gap = (best_known - obj) / best_known * 100
-
-Outputs (results/<timestamp>/):
-  per_instance.csv   one row per instance
-  summary.csv        means grouped by (M, N, alpha), by (M, N) and overall
-  config.json        configuration used
-
-    python Benchmark_zeroShot.py
-    python Benchmark_zeroShot.py --checkpoint checkpoints/best.pt --eval.num_samples 512
-    python Benchmark_zeroShot.py --eval.dims 5,10,30 --eval.ls_enable false
-    python Benchmark_zeroShot.py --baseline_only      # no model: dual-greedy (+ refinement)
+sampleK is exactly K sampled trajectories, excluding the separate greedy rollout.
 """
 from __future__ import annotations
 
-import csv
+import copy
+import hashlib
 import json
-import os
 import sys
 import time
-from collections import defaultdict
 from datetime import datetime
+from pathlib import Path
 
-import numpy as np
 import torch
 
-from mkp_config import get_config, get_device, build_arg_parser, resolve_path
-from mkp_env import MKPEnv, instances_from_dicts, greedy_dual_ratio
-from mkp_refine import iterated_local_search, is_feasible, greedy_fill, _ratio
+from mkp_artifacts import sha256_file, source_provenance, write_json
+from mkp_config import build_arg_parser, get_config, get_device, resolve_path
+from mkp_env import MKPEnv, instances_from_dicts
+from mkp_evaluation import ARMS, paired_report, paired_seed, parse_stages, summarize, write_csv, jsonable
+from mkp_Model import build_model
+from mkp_refine import greedy_fill, is_feasible, iterated_local_search, _ratio
 from mkp_Trainer import load_policy, set_seed
 from read_mat import read_mat
 
@@ -47,190 +32,269 @@ def _sync(device):
         torch.cuda.synchronize(device)
 
 
-def _top_distinct(sol: torch.Tensor, obj: torch.Tensor, k: int):
-    uniq, inv = torch.unique(sol, dim=0, return_inverse=True)
-    best_obj = torch.full((uniq.shape[0],), -1.0, device=obj.device).scatter_reduce(
-        0, inv, obj, reduce="amax")
-    order = best_obj.argsort(descending=True)[:k]
-    return uniq[order], best_obj[order]
+def _audit(solution, inst):
+    rep = inst.repeat(solution.shape[0])
+    if not bool(is_feasible(solution, rep.r, rep.c).all()):
+        raise RuntimeError("Infeasible benchmark solution")
+    slack = rep.c - torch.einsum("bmn,bn->bm", rep.r, solution)
+    if bool(((solution < .5) & (rep.r <= slack[:, :, None] + 1e-6).all(1)).any()):
+        raise RuntimeError("Non-maximal benchmark solution")
 
 
 @torch.no_grad()
-def evaluate_instance(model, env, inst, ec, device, amp, gen):
-    """inst: MKPInstances with B == 1. Returns a dict of metrics."""
-    rec = {}
-    _sync(device); t0 = time.time()
-    mu, ub = env.precompute(inst)
-    rec["ub_lp"] = float(ub[0])
-    rec["dual_greedy_obj"] = float(greedy_dual_ratio(inst, mu)[0])
-    N = inst.N
-    sols, objs = [], []
-    if model is not None:
-        g = model(env, inst, num_samples=1, decode="greedy", amp=amp, pre=(mu, ub))
-        rec["greedy_obj"] = float(g["profit"][0])
-        rec["greedy_rejects"] = float(g["n_reject"][0])
-        rec["greedy_steps"] = int(g["steps"])
-        rec["kappa"] = g["kappa"]
-        for name, w in zip(g["primitives"], g["prim_w"]):
-            rec[f"w_{name}"] = w
-        rec["abs_residual"] = g["abs_residual"]
-        rec["abs_log_price"] = g["log_price_abs"]
-        sols.append(g["solution"]); objs.append(g["profit"])
-        S = ec.num_samples
-        rej, steps = [], []
-        while S > 0:
-            k = min(S, ec.max_rollouts_per_chunk)
-            o = model(env, inst, num_samples=k, decode="sample", temperature=ec.sample_temperature,
-                      amp=amp, pre=(mu, ub))
-            sols.append(o["solution"]); objs.append(o["profit"])
-            rej.append(o["n_reject"]); S -= k
-        allrej = torch.cat(rej) if rej else torch.zeros(1, device=device)
-        rec["sample_mean_rejects"] = float(allrej.mean())
-        rec["sample_feasible_pick_rate"] = float(1.0 - (allrej / max(N, 1)).mean())
+def _historical_rollout(env, inst, pre, k, decode, temperature):
+    """Historical static-c ratio, plus an explicitly named stochastic extension."""
+    mu, ub = pre
+    rp, prices = inst.repeat(k), mu.repeat_interleave(k, 0)
+    score = _ratio(rp.p, rp.r, rp.c, prices).clamp_min(1e-6).log()
+    if decode == "greedy":
+        sol = greedy_fill(torch.zeros_like(rp.p), rp.p, rp.r, rp.c, score)
     else:
-        # baseline: dual greedy + noisy dual greedy starts
-        T = max(ec.ls_pool, 1)
-        rp = inst.repeat(T)
-        sc = torch.log(_ratio(rp.p, rp.r, rp.c, mu.repeat(T, 1)))
-        noise = 0.3 * torch.rand(sc.shape, generator=gen, device="cpu").to(device)
-        noise[0] = 0
-        x0 = greedy_fill(torch.zeros(T, N, device=device), rp.p, rp.r, rp.c, sc + noise)
-        sols.append(x0); objs.append((x0 * rp.p).sum(1))
-    sol = torch.cat(sols, 0); obj = torch.cat(objs, 0)
-    assert bool(is_feasible(sol, inst.r.expand(sol.shape[0], -1, -1), inst.c.expand(sol.shape[0], -1)).all())
-    rec["policy_obj"] = float(obj.max())
-    rec["policy_mean_obj"] = float(obj.mean())
-    _sync(device); rec["time_policy_s"] = time.time() - t0
+        st = env.reset(rp, prices, ub.repeat_interleave(k, 0))
+        while not bool(st.done.all()):
+            logits = (score / temperature).masked_fill(~st.fits, -1e9)
+            logits = torch.where(st.done[:, None], torch.zeros_like(logits), logits)
+            st = env.step(st, torch.multinomial(logits.softmax(-1), 1).squeeze(-1))
+        sol = st.solution
+    return {"solution": sol, "profit": (sol * rp.p).sum(1), "trace": []}
 
-    final = rec["policy_obj"]
-    t1 = time.time()
-    if ec.ls_enable:
-        pool, _ = _top_distinct(sol, obj, ec.ls_pool)
-        for s in range(0, pool.shape[0], ec.ls_batch):
-            x = pool[s:s + ec.ls_batch]
-            b = x.shape[0]
-            rp = inst.repeat(b)
-            bx, bo = iterated_local_search(x, rp.p, rp.r, rp.c, mu.repeat(b, 1), rounds=ec.ils_rounds,
-                                           perturb_max=ec.ils_perturb_max, max_iters=ec.ls_max_iters,
-                                           drop_k=ec.ls_drop_k, generator=gen)
-            assert bool(is_feasible(bx, rp.r, rp.c).all())
-            final = max(final, float(bo.max()))
+
+@torch.no_grad()
+def evaluate_stage(model, env, inst, ec, device, amp, pre, stage, arm, seed, instance_id,
+                   root_lp_seconds=0.0, artifact_sink=None):
+    spec = parse_stages([stage], ec.num_samples)[0]
+    rng_seed = paired_seed(seed, instance_id, stage)
+    set_seed(rng_seed)
+    gen = torch.Generator(device="cpu").manual_seed(rng_seed)
+    mu, ub = pre
+    sols, objs = [], []
     _sync(device)
-    rec["time_refine_s"] = time.time() - t1
-    rec["final_obj"] = final
-    rec["time_total_s"] = time.time() - t0
-    return rec
+    start, remaining, offset, artifact_seconds = time.perf_counter(), spec["budget"], 0, 0.0
+    while remaining:
+        k = min(remaining, ec.max_rollouts_per_chunk)
+        if arm == "fixed_dualgreedy":
+            out = _historical_rollout(env, inst, pre, k, spec["decode"], ec.sample_temperature)
+        else:
+            kwargs = {"theta_override": "fixed"} if arm == "fixed" else {}
+            out = model(env, inst, num_samples=k, decode=spec["decode"],
+                        temperature=ec.sample_temperature, amp=amp, pre=pre,
+                        return_trace=True, **kwargs)
+        sols.append(out["solution"])
+        objs.append(out["profit"])
+        if artifact_sink is not None:
+            _sync(device)
+            astart = time.perf_counter()
+            artifact_sink({"arm": arm, "stage": stage, "sample_offset": offset,
+                           "solutions": out["solution"], "objectives": out["profit"],
+                           "theta_trace": out.get("trace", [])})
+            artifact_seconds += time.perf_counter() - astart
+        remaining -= k
+        offset += k
+    _sync(device)
+    construction_seconds = time.perf_counter() - start - artifact_seconds
+    solution, objective = torch.cat(sols), torch.cat(objs)
+    _audit(solution, inst)
+    idx = int(objective.argmax())
+    best_solution, best_obj = solution[idx:idx + 1], float(objective[idx])
+    refine_seconds, pool_size = 0.0, 0
+    if spec["refine"]:
+        # Retain duplicates to avoid unequal numbers of ILS starts between arms.
+        pool_size = min(ec.ls_pool, spec["budget"])
+        pool = solution[objective.argsort(descending=True)[:pool_size]]
+        gen.manual_seed(paired_seed(seed, instance_id, stage, "ILS"))
+        _sync(device)
+        start, artifact_seconds = time.perf_counter(), 0.0
+        for offset in range(0, pool_size, ec.ls_batch):
+            x = pool[offset:offset + ec.ls_batch]
+            rp = inst.repeat(x.shape[0])
+            bx, bo = iterated_local_search(x, rp.p, rp.r, rp.c, mu.repeat_interleave(x.shape[0], 0),
+                rounds=ec.ils_rounds, perturb_max=ec.ils_perturb_max,
+                max_iters=ec.ls_max_iters, drop_k=ec.ls_drop_k, generator=gen)
+            idx = int(bo.argmax())
+            if float(bo[idx]) > best_obj:
+                best_obj, best_solution = float(bo[idx]), bx[idx:idx + 1]
+            if artifact_sink is not None:
+                _sync(device)
+                astart = time.perf_counter()
+                artifact_sink({"arm": arm, "stage": stage, "refine_start_offset": offset,
+                               "refined_solutions": bx, "refined_objectives": bo})
+                artifact_seconds += time.perf_counter() - astart
+        _sync(device)
+        refine_seconds = time.perf_counter() - start - artifact_seconds
+        _audit(best_solution, inst)
+    return {"stage": stage, "budget": spec["budget"], "objective": best_obj,
+            "ub_lp": float(ub[0]), "time_lp_s": root_lp_seconds,
+            "time_construct_s": construction_seconds, "time_refine_s": refine_seconds,
+            "time_total_s": root_lp_seconds + construction_seconds + refine_seconds,
+            "search_starts": pool_size, "ils_rounds": ec.ils_rounds if spec["refine"] else 0,
+            "ls_max_iters": ec.ls_max_iters if spec["refine"] else 0,
+            "ls_drop_k": ec.ls_drop_k if spec["refine"] else 0,
+            "ils_perturb_max": ec.ils_perturb_max if spec["refine"] else 0,
+            "sample_temperature": ec.sample_temperature, "rng_seed": rng_seed,
+            "solution": best_solution[0].to(torch.int8).cpu().tolist(), "feasible": True, "maximal": True}
+
+
+def _load_arms(cfg, arms, checkpoint, static_checkpoint, device):
+    models, configs, checkpoints = {}, {}, {}
+    reference_cfg, training_seed = cfg, cfg.device.seed
+    load_names = [a for a in arms if a.startswith("learned_")]
+    if not load_names and checkpoint:
+        load_names = ["reference"]
+    for name in load_names:
+        path = static_checkpoint if name == "learned_static" and static_checkpoint else checkpoint
+        path = resolve_path(path or cfg.eval.checkpoint)
+        model, mc, ck = load_policy(path, device, cfg_override=cfg)
+        if name.startswith("learned_"):
+            expected = "static" if name == "learned_static" else "step"
+            if mc.model.theta_update != expected:
+                raise ValueError(f"{name} requires a separately trained theta_update={expected} checkpoint; "
+                                 f"{path} was trained with {mc.model.theta_update}")
+        ck_seed = int(ck.get("config", {}).get("device", {}).get("seed", cfg.device.seed))
+        if checkpoints:
+            if ck_seed != training_seed:
+                raise ValueError("Matched arms must use the same training seed")
+            lhs, rhs = reference_cfg.to_dict(), mc.to_dict()
+            for conf in (lhs, rhs):
+                for key in ("theta_update", "untrained_random_heads"):
+                    conf["model"].pop(key, None)
+            if lhs["model"] != rhs["model"] or lhs["env"] != rhs["env"]:
+                raise ValueError("Matched checkpoints must share encoder, theta groups and executor")
+            for key in ("epochs", "steps_per_epoch", "batch_size", "num_samples"):
+                if getattr(reference_cfg.train, key) != getattr(mc.train, key):
+                    raise ValueError(f"Static/dynamic training budgets differ: {key}")
+        reference_cfg, training_seed = mc, ck_seed
+        models[name], configs[name] = model, mc
+        checkpoints[name] = {"path": path, "sha256": sha256_file(path), "epoch": ck.get("epoch"),
+                             "selection_rule": ck.get("selection_rule", "not_recorded"),
+                             "config": ck.get("config"), "training_seed": ck_seed}
+    for name in arms:
+        if name.startswith("learned_"):
+            continue
+        mc = copy.deepcopy(reference_cfg)
+        # The untrained primary control always uses per-step theta, independent
+        # of the order in which static/dynamic checkpoints were requested.
+        mc.model.theta_update = "step"
+        mc.model.untrained_random_heads = name == "untrained"
+        set_seed(training_seed)
+        models[name] = None if name == "fixed_dualgreedy" else build_model(mc).to(device).eval()
+        configs[name] = mc
+    models.pop("reference", None)
+    configs.pop("reference", None)
+    return models, configs, checkpoints, training_seed
+
+
+def protocol_sha256(cfg):
+    model = cfg.to_dict()["model"]
+    for key in ("theta_update", "untrained_random_heads"):
+        model.pop(key, None)
+    protocol = {"formula": "weak_decoder_t1_g0g1_v1", "model": model, "env": cfg.to_dict()["env"],
+                "sampling": "exact-K-excluding-greedy", "search": "top-pool-retaining-duplicates",
+                "global_temperature": "initial-for-controls-fitted-for-learned"}
+    return hashlib.sha256(json.dumps(protocol, sort_keys=True).encode()).hexdigest()
 
 
 def main(argv=None):
-    parser = build_arg_parser("Zero-shot benchmark on Benchmarks_Chu.mat.")
-    parser.add_argument("--checkpoint", type=str, default=None, help="overrides eval.checkpoint")
-    parser.add_argument("--baseline_only", action="store_true",
-                        help="no model: dual-ratio greedy starts (+ refinement if enabled)")
+    parser = build_arg_parser("Matched zero-shot weak-decoder evaluation.")
+    parser.add_argument("--checkpoint", "--dynamic_checkpoint", dest="checkpoint", default=None)
+    parser.add_argument("--static_checkpoint", default=None)
+    parser.add_argument("--arm", default="learned_dynamic", help="comma-separated subset of " + ",".join(ARMS))
+    parser.add_argument("--stages", default="greedy")
+    parser.add_argument("--baseline_only", action="store_true", help="alias for --arm fixed_dualgreedy")
     args, overrides = parser.parse_known_args(argv)
     cfg = get_config(overrides)
     if args.checkpoint:
         cfg.eval.checkpoint = args.checkpoint
+    arms = ["fixed_dualgreedy"] if args.baseline_only else args.arm.split(",")
+    if not arms or len(set(arms)) != len(arms) or any(a not in ARMS for a in arms):
+        raise ValueError(f"--arm must be a unique subset of {ARMS}")
+    stages = [s["name"] for s in parse_stages(args.stages.split(","), cfg.eval.num_samples)]
+    stages.sort(key=lambda name: name != "greedy")
     if args.print_config:
-        print(json.dumps(cfg.to_dict(), indent=2)); return
-    set_seed(cfg.device.seed)
-    device = get_device(cfg)
+        print(json.dumps({**cfg.to_dict(), "arms": arms, "stages": stages}, indent=2))
+        return
     ec = cfg.eval
-
-    model, mcfg = None, cfg
-    ckpt_name = "baseline"
-    if not args.baseline_only:
-        ck_path = resolve_path(ec.checkpoint)
-        if not os.path.isfile(ck_path):
-            raise FileNotFoundError(f"checkpoint not found: {ck_path} (train first, or use --baseline_only)")
-        model, mcfg, ck = load_policy(ck_path, device, cfg_override=cfg)
-        ckpt_name = f"{ck.get('run_name', 'model')}_ep{ck.get('epoch', '?')}"
-        print(f"[bench] loaded {ck_path} (run {ck.get('run_name')}, epoch {ck.get('epoch')}, "
-              f"best val {ck.get('best_val')})")
-    env = MKPEnv(mcfg.env)
-    amp = cfg.device.amp and device.type == "cuda"
-    gen = torch.Generator().manual_seed(cfg.device.seed)
-
-    data = read_mat(resolve_path(ec.mat_file))
-    data = [d for d in data if d["M"] in ec.dims and d["N"] in ec.sizes]
-    if ec.max_instances > 0:
-        data = data[:ec.max_instances]
+    if min(ec.max_rollouts_per_chunk, ec.ls_pool, ec.ls_batch) < 1:
+        raise ValueError("rollout chunk, search pool and search batch must be positive")
+    if ec.sample_temperature <= 0 or min(ec.ils_rounds, ec.ls_max_iters, ec.ls_drop_k) < 0:
+        raise ValueError("temperature must be positive and search budgets nonnegative")
+    device = get_device(cfg)
+    models, configs, checkpoints, training_seed = _load_arms(cfg, arms, args.checkpoint, args.static_checkpoint, device)
+    envs = {a: MKPEnv(configs[a].env) for a in arms}
+    if any(configs[a].env.feasibility_mode != "hard_mask" for a in arms):
+        raise ValueError("Main arms require hard_mask; rejection-mode results need a named ablation")
+    path = resolve_path(ec.mat_file)
+    data = [d for d in read_mat(path) if d["M"] in ec.dims and d["N"] in ec.sizes]
+    data = data[:ec.max_instances] if ec.max_instances > 0 else data
     if not data:
-        raise RuntimeError("no benchmark instance matches eval.dims / eval.sizes")
-
-    out_dir = resolve_path(os.path.join(ec.results_dir, f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{ckpt_name}"))
-    os.makedirs(out_dir, exist_ok=True)
-    cfg.save(os.path.join(out_dir, "config.json"))
-    per_path = os.path.join(out_dir, "per_instance.csv")
-    print(f"[bench] {len(data)} instances -> {out_dir}")
-
+        raise RuntimeError("No benchmark instances match eval.dims/sizes")
+    out_dir = Path(resolve_path(ec.results_dir)) / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    out_dir.mkdir(parents=True)
+    cfg.save(str(out_dir / "config.json"))
+    source = source_provenance()
+    (out_dir / "source_diff.patch").write_text(source.get("diff", ""), encoding="utf-8")
+    meta = {"schema": "weak_decoder_benchmark_t1_v1", "status": "running", "source": source,
+            "config": cfg.to_dict(), "arm_configs": {a: configs[a].to_dict() for a in arms},
+            "dataset": path, "data_sha256": sha256_file(path), "instance_ids": [d["id"] for d in data],
+            "checkpoints": checkpoints, "training_seed": training_seed,
+            "evaluation_seed": cfg.device.seed, "arms": arms, "stages": stages,
+            "protocol_sha256": {a: protocol_sha256(configs[a]) for a in arms},
+            "device": str(device), "amp": cfg.device.amp and device.type == "cuda", "primary_stage": "greedy",
+            "primary_stage_evaluated": "greedy" in stages,
+            "reference": "Chu best-known values; not proven optima",
+            "timing": "GPU synchronized; root LP shared per instance, charged once to each arm/stage. "
+                      "Construction includes per-step theta trace capture/CPU copies. JSON serialization, "
+                      "artifact output, audits and model loading excluded.",
+            "protocol": "sampleK is K samples excluding greedy. ILS retains duplicate starts for matched budgets. "
+                        "Stage RNG resets by evaluation seed, instance ID and stage, independently of arm.",
+            "historical_reference": "fixed_dualgreedy uses static capacities/root dual. Its sampling extension "
+                                    "softmaxes log ratio; this arm is not a matched-executor control.",
+            "temperature_control": "fixed/untrained use the configured initial global T; learned arms use "
+                                   "their fitted global T. Greedy is invariant to T. Sampling comparisons "
+                                   "therefore include the effect of learning a global temperature.",
+            "evidence": "One training seed per invocation. Combine >=3 independent training seeds with "
+                        "mkp_evaluation.py --inputs. This evaluator never selects weights."}
+    write_json(out_dir / "meta.json", meta)
     rows = []
-    fields = None
-    for i, d in enumerate(data):
-        inst = instances_from_dicts([d], device=device)
-        alpha = float(np.round(float(inst.c.sum() / inst.r.sum()), 2))
-        rec = evaluate_instance(model, env, inst, ec, device, amp, gen)
-        best = float(d["best"])
-        gap = lambda v: (best - v) / best * 100.0
-        row = {"id": d["id"], "M": d["M"], "N": d["N"], "alpha": alpha, "best_known": best, **rec}
-        row["gap_dual_greedy"] = gap(rec["dual_greedy_obj"])
-        if "greedy_obj" in rec:
-            row["gap_greedy"] = gap(rec["greedy_obj"])
-        row["gap_policy"] = gap(rec["policy_obj"])
-        row["gap_final"] = gap(rec["final_obj"])
-        row["gap_lp_bound_to_best"] = (rec["ub_lp"] - best) / best * 100.0
-        rows.append(row)
-        if fields is None:
-            fields = list(row.keys())
-        with open(per_path, "a", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
-            if i == 0:
-                w.writeheader()
-            w.writerow(row)
-        print(f"[{i + 1}/{len(data)}] id {d['id']:3d} M{d['M']} N{d['N']} a{alpha:.2f} | "
-              + (f"greedy {row['gap_greedy']:.3f}% | " if "gap_greedy" in row else "")
-              + f"policy {row['gap_policy']:.3f}% | final {row['gap_final']:.3f}% | "
-              f"dual-greedy {row['gap_dual_greedy']:.3f}% | {rec['time_total_s']:.1f}s", flush=True)
-
-    # ---------------------------------------------------------------- summary
-    metric_keys = [k for k in rows[0] if k.startswith("gap_") or k.startswith("time_")
-                   or k in ("greedy_rejects", "sample_mean_rejects", "sample_feasible_pick_rate", "kappa",
-                            "abs_residual", "abs_log_price") or k.startswith("w_")]
-    groups = defaultdict(list)
-    for r in rows:
-        groups[(r["M"], r["N"], r["alpha"])].append(r)
-        groups[(r["M"], r["N"], "all")].append(r)
-        groups[("all", "all", "all")].append(r)
-
-    def sort_key(k):
-        return tuple((1e9 if v == "all" else float(v)) for v in k)
-
-    summ = []
-    for key in sorted(groups, key=sort_key):
-        rs = groups[key]
-        s = {"M": key[0], "N": key[1], "alpha": key[2], "count": len(rs)}
-        for mk in metric_keys:
-            vals = [r[mk] for r in rs if mk in r]
-            s[f"mean_{mk}"] = float(np.mean(vals)) if vals else ""
-        s["max_gap_final"] = float(np.max([r["gap_final"] for r in rs]))
-        s["n_optimal_final"] = int(sum(r["gap_final"] <= 1e-9 for r in rs))
-        summ.append(s)
-    sum_path = os.path.join(out_dir, "summary.csv")
-    with open(sum_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=list(summ[0].keys()))
-        w.writeheader(); w.writerows(summ)
-
-    print("\n=========== Zero-shot summary (gap % vs best known) ===========")
-    hdr = f"{'M':>4} {'N':>4} {'cnt':>4} | {'greedy':>8} {'policy':>8} {'final':>8} {'dualGr':>8} | {'time(s)':>8}"
-    print(hdr); print("-" * len(hdr))
-    for s in summ:
-        if s["alpha"] != "all":
-            continue
-        g = s.get("mean_gap_greedy", "")
-        print(f"{str(s['M']):>4} {str(s['N']):>4} {s['count']:>4} | "
-              f"{(f'{g:8.4f}' if g != '' else '     n/a')} {s['mean_gap_policy']:8.4f} {s['mean_gap_final']:8.4f} "
-              f"{s['mean_gap_dual_greedy']:8.4f} | {s['mean_time_total_s']:8.2f}")
-    print(f"\nper-instance -> {per_path}\nsummary      -> {sum_path}")
+    try:
+        with (out_dir / "trajectories.jsonl").open("w", encoding="utf-8") as artifact_file:
+            for index, d in enumerate(data):
+                inst = instances_from_dicts([d], device=device)
+                _sync(device)
+                start = time.perf_counter()
+                pre = envs[arms[0]].precompute(inst)
+                _sync(device)
+                lp_seconds = time.perf_counter() - start
+                alpha = round(float(inst.c.sum() / inst.r.sum()), 2)
+                for arm in arms:
+                    for stage in stages:
+                        def sink(record):
+                            artifact_file.write(json.dumps(jsonable({"id": d["id"], "seed": training_seed, **record})) + "\n")
+                        rec = evaluate_stage(models[arm], envs[arm], inst, ec, device, meta["amp"], pre,
+                                             stage, arm, cfg.device.seed, d["id"], lp_seconds, sink)
+                        sol = rec.pop("solution")
+                        row = {"id": d["id"], "M": d["M"], "N": d["N"], "alpha": alpha,
+                               "arm": arm, "seed": training_seed, "evaluation_seed": cfg.device.seed,
+                               "data_sha256": meta["data_sha256"], "protocol_sha256": meta["protocol_sha256"][arm],
+                               "best_known": float(d["best"]), **rec}
+                        row["gap_pct"] = (row["best_known"] - rec["objective"]) / row["best_known"] * 100
+                        rows.append(row)
+                        sink({"arm": arm, "stage": stage, "best_solution": sol, "objective": row["objective"]})
+                        print(f"[{index + 1}/{len(data)}] id={d['id']} {arm} {stage} "
+                              f"gap={row['gap_pct']:.4f}% time={row['time_total_s']:.2f}s", flush=True)
+                write_csv(out_dir / "per_instance.csv", rows)
+                artifact_file.flush()
+        write_csv(out_dir / "summary.csv", summarize(rows))
+        pairs, statistics = paired_report(rows)
+        write_csv(out_dir / "paired_per_instance.csv", pairs)
+        write_csv(out_dir / "paired_summary.csv", statistics)
+        meta["status"], meta["row_count"] = "complete", len(rows)
+    except Exception as exc:
+        meta["status"], meta["error"] = "failed", repr(exc)
+        raise
+    finally:
+        write_json(out_dir / "meta.json", meta)
+    print(f"Results: {out_dir}")
+    return out_dir
 
 
 if __name__ == "__main__":

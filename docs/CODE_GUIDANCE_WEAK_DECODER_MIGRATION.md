@@ -1,5 +1,7 @@
 # 代码指导：把 main_v0 的低 gap 经验迁移到"弱解码器 + 低维资源级 θ"主路线
 
+> **勘误（2026-11-04，Claude）：** T0 全量结果否定了 §0 第 2 条（δ 对 greedy 贡献仅 −0.013 pp，不显著）；§3 删除 κ 并由全局可学习 T 承担锐度的设计导致 T1 训练失败（α 顶到上界，被当作逆温度使用）；§6 中 T2 的立论需要改写。修正后的执行器、对照口径与下一步任务 T1-R 见 [T0_T1_ANALYSIS_AND_T1R_GUIDANCE.md](T0_T1_ANALYSIS_AND_T1R_GUIDANCE.md)。与该文冲突时以该文为准；研究边界（§1）不变。
+>
 > 适用：`Constrained_AwareMKP` 的 `main_v0@6a4cf82`（"当前代码"）。执行方：Codex。指导方：Claude。
 > 旧项目：`RL_ModelInhance`（v6，`40_lp-dual-bipartite-bound-shaping@a933ff7`）。
 > 研究边界以 `docs/RESEARCH_HANDOFF_FROM_OLD_PROJECT.md` 第 2 节为准，本指导不放宽任何条目。

@@ -36,8 +36,9 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 # --------------------------------------------------------------------------------------
 @dataclass
 class DeviceConfig:
-    # The local machine has two RTX 4090s; GPU 0 is busy -> use GPU 1.
+    # Prefer GPU 1 where available; get_device falls back to GPU 0 or CPU.
     cuda_device: int = 1
+    force_cpu: bool = False
     # bf16 autocast for the attention stacks (env / decoder / rewards always stay fp32).
     amp: bool = True
     seed: int = 1234
@@ -57,17 +58,17 @@ class EnvConfig:
     weight_max: int = 1000           # r_ij ~ U{0..weight_max}
     profit_noise: float = 500.0      # p_j = sum_i r_ij / M + profit_noise * U(0,1)
 
-    # How infeasible picks are treated (see README "Constraint awareness without masks"):
+    # The main method selects only feasible items; the other modes are named ablations.
     #   "perceive"  : NO feasibility mask. An infeasible pick is *rejected* by the env (the
     #                 item is discarded, capacities untouched) and penalised. Because
     #                 capacities only shrink, a rejected item could never fit again, so the
     #                 rejection is loss-free for solution quality; the agent must perceive
     #                 feasibility from the state to avoid wasting steps / penalties.
     #   "soft_mask" : additionally add -soft_mask_beta * violation to the logits (ablation).
-    #   "hard_mask" : classic -inf mask on infeasible items (ablation / upper reference).
-    feasibility_mode: str = "perceive"
+    #   "hard_mask" : -inf mask on infeasible items (main method).
+    feasibility_mode: str = "hard_mask"
     soft_mask_beta: float = 5.0
-    reject_penalty: float = 0.1      # reward -= reject_penalty * (#rejected picks) / N
+    reject_penalty: float = 0.1      # used only in perceive/soft_mask ablations
 
     # Batched Lagrangian-dual (LP relaxation) approximation used for features + bound.
     dual_iters: int = 300
@@ -91,16 +92,15 @@ class ModelConfig:
     # Edge-feature MLP hidden size for the item-resource attention biases.
     edge_hidden: int = 32
 
-    # Strategy primitives of the weak decoder (subset/order is configurable):
-    #   profit | efficiency | price_ratio | slack
-    primitives: List[str] = field(default_factory=lambda: ["profit", "efficiency", "price_ratio", "slack"])
-    init_primitive: str = "price_ratio"   # primitive favoured at initialisation (warm start)
-    init_primitive_logit: float = 2.0
-    price_log_range: float = 3.0          # learned prices lambda_t = base * exp(+-range)
+    # T1 implements G0+G1 only. Later groups require separately reviewed experiments.
+    theta_groups: List[str] = field(default_factory=lambda: ["price", "alpha"])
+    price_anchor: str = "root"
+    u_max: float = 3.0                   # tanh bound before centering (sum_j u_j = 0)
+    theta_update: str = "step"           # step | static (static must be trained separately)
+    temperature_mode: str = "learned"    # one global scalar, independent of state and N
+    temperature_init: float = 1.0 / 3.0
+    untrained_random_heads: bool = False # True only for the untrained control arm
     price_floor: float = 0.05             # floor (relative to mean dual price) for non-binding dims
-    kappa_init: float = 3.0               # initial inverse temperature of the weak decoder
-    kappa_min: float = 0.1
-    residual_max: float = 3.0             # |delta_j| bound of the per-item learned residual
     grad_checkpoint: bool = True          # checkpoint the per-step controller (saves memory)
 
 
@@ -122,7 +122,12 @@ class TrainConfig:
     entropy_coef: float = 0.01
     adv_normalize: bool = True
 
-    # validation on a fixed set of generated instances (greedy decoding, gap vs LP bound)
+    # Fixed synthetic validation only; Chu instances never select checkpoints.
+    validation_reference: str = "milp"   # milp | lp (LP is an explicit diagnostic)
+    val_seed: int = 20240607
+    val_milp_time_limit: float = 10.0
+    val_mip_rel_gap: float = 1e-9
+    reference_cache: str = "cache"
     val_instances: int = 64               # per (N, M) pair
     val_sizes: List[int] = field(default_factory=lambda: [100])
     val_dims: List[int] = field(default_factory=lambda: [5, 10])
@@ -148,14 +153,12 @@ class EvalConfig:
     checkpoint: str = os.path.join("checkpoints", "best.pt")
     results_dir: str = "results"
 
-    num_samples: int = 256                # sampled rollouts per instance (+1 greedy)
+    num_samples: int = 256                # exact K for sampleK (greedy is a separate stage)
     sample_temperature: float = 1.0
     max_rollouts_per_chunk: int = 2048
 
-    # Post-hoc interpretable refinement (classic MKP moves, applied to the best
-    # `ls_pool` distinct policy solutions). Disable for a pure-policy measurement;
-    # the CSV always reports policy-only gaps too.
-    ls_enable: bool = True
+    # External refinement stages; equal ls_pool startup budgets apply to every arm.
+    ls_enable: bool = False
     ls_pool: int = 16
     ls_max_iters: int = 200
     ls_drop_k: int = 32                   # candidate items for the drop-and-refill move
@@ -259,6 +262,8 @@ def resolve_path(path: str) -> str:
 
 def get_device(cfg: Config):
     import torch
+    if cfg.device.force_cpu:
+        return torch.device("cpu")
     if torch.cuda.is_available():
         n = torch.cuda.device_count()
         idx = cfg.device.cuda_device

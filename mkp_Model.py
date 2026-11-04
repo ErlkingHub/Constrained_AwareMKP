@@ -1,52 +1,8 @@
-"""
-mkp_Model.py
-============
-Hierarchical, constraint-aware policy for the Multidimensional Knapsack Problem.
+"""Item-resource relation encoder, resource-level theta controller and fixed executor.
 
-    MKP instance
-      -> Dynamic MKP environment (mkp_env.MKPEnv)
-      -> State Encoder        : item <-> resource bipartite graph Transformer (static, once)
-                                + dynamic state injection at every step
-      -> High-Level Strategy Controller : dual-axis Transformer over the *current* state that
-                                outputs an interpretable strategy  (lambda_t, w_t, kappa_t, delta)
-      -> Low-Level Weak Decoder : parameter-free scorer combining a handful of classic MKP
-                                primitives with the strategy, softmax / argmax
-      -> select item, env updates remaining capacities, repeat until nothing fits.
-
-Multi-head attention captures two kinds of competition (the "dual axis"):
-  * item  <-> item      self-attention   : profit competition among the remaining items
-  * item  <-> resource  cross-attention  : resource competition; attention scores are biased by
-                                           the (static + per-step) consumption matrix, so every
-                                           head sees how much of each *remaining* capacity an
-                                           item would consume (MatNet-style mixed scores)
-  * resource <-> resource self-attention : competition / coupling between resource dimensions
-
-Strategy (high level, per step t):
-  lambda_t in R^M_+  learned resource prices = LP-dual prices * exp(+-price_log_range)
-  w_t in simplex^K   mixture over K interpretable primitives
-  kappa_t > 0        decisiveness (inverse temperature)
-  delta_j            bounded per-item residual correction (|delta| <= residual_max)
-
-Weak decoder (low level, no parameters):
-  score_j = kappa_t * sum_k w_tk * z(phi_k(j)) + delta_j,     z = z-score over remaining items
-  phi_profit      = log p_j
-  phi_efficiency  = log p_j - log sum_i r_ij / c_i                      (static efficiency)
-  phi_price_ratio = log p_j - log sum_i lambda_ti r_ij / c_rem_i        (dynamic surrogate ratio)
-  phi_slack       = min_i (c_rem_i - r_ij) / c_i                        (bottleneck slack, <0 if infeasible)
-
-References (ideas adopted, all re-implemented here):
-  [1] Chu & Beasley (1998) J. Heuristics 4:63-86 - instance generator and LP-dual pseudo-utility
-      ratio -> training distribution, `price_ratio` primitive and LP-dual features.
-  [2] Pirkul (1987) Naval Res. Logist. 34:161-172 - surrogate-dual multipliers for MKP greedy
-      -> resource prices as the controller's main "strategy" variable.
-  [3] Senju & Toyoda (1968) Manage. Sci. 14:B53-B68 - effective gradient: weight resources by
-      their *remaining* capacity -> c_rem in the price-ratio primitive.
-  [4] Gasse et al. (2019) NeurIPS - variable/constraint bipartite graph of a MILP -> item/resource
-      tokens of the state encoder.
-  [5] Kwon et al. (2021) MatNet, NeurIPS - matrix (edge) values injected into cross-attention
-      scores between row/column nodes -> edge-biased item<->resource attention.
-  [6] Kool et al. (2019) ICLR - Transformer encoder + REINFORCE for CO.
-  [7] Kwon et al. (2020) POMO, NeurIPS - shared multi-sample baseline (used in mkp_Trainer).
+T1 interface: M centered log-price corrections u and optional scalar alpha.
+The encoder has item tokens, but no learned item-level output enters the score.
+Static encoding is cached once; the original per-step representation is preserved.
 """
 from __future__ import annotations
 
@@ -63,9 +19,8 @@ from mkp_env import (MKPEnv, MKPInstances, MKPState,
                      F_ITEM_STATIC, F_RES_STATIC, F_EDGE_STATIC,
                      F_ITEM_DYN, F_RES_DYN, F_EDGE_DYN, F_GLOBAL)
 
-NEG = -1e4          # finite "minus infinity" for logits (keeps entropy / grads NaN-free)
+NEG = float("-inf")
 _EPS = 1e-6
-PRIMITIVES = ("profit", "efficiency", "price_ratio", "slack")
 
 
 # ======================================================================================
@@ -206,10 +161,12 @@ class StrategyController(nn.Module):
         super().__init__()
         d = cfg.embed_dim
         self.cfg = cfg
-        self.prims = list(cfg.primitives)
-        for p in self.prims:
-            assert p in PRIMITIVES, f"unknown primitive '{p}'"
-        K = len(self.prims)
+        groups = list(cfg.theta_groups)
+        if len(groups) != len(set(groups)) or "price" not in groups:
+            raise ValueError("theta_groups must contain price exactly once")
+        if set(groups) - {"price", "alpha"}:
+            raise ValueError("T1 supports price/alpha only; block and lp belong to T2/T3")
+        self.scalar_names = [name for name in ("alpha",) if name in groups]
         self.blocks = nn.ModuleList([
             DualAxisBlock(d, cfg.num_heads, cfg.ff_mult, cfg.dropout,
                           F_EDGE_STATIC + F_EDGE_DYN, cfg.edge_hidden)
@@ -217,26 +174,17 @@ class StrategyController(nn.Module):
         self.ln_x, self.ln_y = nn.LayerNorm(d), nn.LayerNorm(d)
         self.ctx = nn.Sequential(nn.Linear(4 * d, d), nn.GELU(), nn.Linear(d, d))
         self.price_head = nn.Sequential(nn.Linear(2 * d, d), nn.GELU(), nn.Linear(d, 1))
-        self.prim_head = nn.Linear(d, K)
-        self.kappa_head = nn.Linear(d, 1)
-        self.res_head = nn.Sequential(nn.Linear(2 * d, d), nn.GELU(), nn.Linear(d, 1))
+        self.scalar_head = nn.Linear(d, len(self.scalar_names)) if self.scalar_names else None
         self._init_heads()
 
     def _init_heads(self):
-        cfg = self.cfg
-        # zero-init -> the untrained policy is exactly the (stochastic) classic heuristic
-        # defined by the initial primitive mixture: a strong, interpretable warm start.
-        for head in (self.price_head[-1], self.res_head[-1]):
-            nn.init.zeros_(head.weight); nn.init.zeros_(head.bias)
-        nn.init.zeros_(self.prim_head.weight)
-        with torch.no_grad():
-            self.prim_head.bias.zero_()
-            if cfg.init_primitive in self.prims:
-                self.prim_head.bias[self.prims.index(cfg.init_primitive)] = cfg.init_primitive_logit
-        nn.init.zeros_(self.kappa_head.weight)
-        target = max(cfg.kappa_init - cfg.kappa_min, 1e-3)
-        with torch.no_grad():
-            self.kappa_head.bias.fill_(math.log(math.expm1(target)))   # softplus^-1
+        if self.cfg.untrained_random_heads:
+            return  # Preserve PyTorch's default random head initialization for this control.
+        nn.init.zeros_(self.price_head[-1].weight)
+        nn.init.zeros_(self.price_head[-1].bias)
+        if self.scalar_head is not None:
+            nn.init.zeros_(self.scalar_head.weight)
+            nn.init.constant_(self.scalar_head.bias, math.log(1.0 / 3.0))  # alpha=1
 
     def forward(self, x, y, g, edge, avail):
         done = ~avail.any(1)
@@ -250,172 +198,194 @@ class StrategyController(nn.Module):
         x_max = x.masked_fill(~keep[:, :, None], -1e4).max(1).values
         ctx = self.ctx(torch.cat([x_mean, x_max, y.mean(1), g], dim=-1))       # (B,d)
         cfg = self.cfg
-        M, N = y.shape[1], x.shape[1]
-        price = cfg.price_log_range * torch.tanh(
-            self.price_head(torch.cat([y, ctx[:, None, :].expand(-1, M, -1)], -1)).squeeze(-1))
-        prim_w = torch.softmax(self.prim_head(ctx).float(), dim=-1)
-        kappa = cfg.kappa_min + F.softplus(self.kappa_head(ctx).float()).squeeze(-1)
-        resid = cfg.residual_max * torch.tanh(
-            self.res_head(torch.cat([x, ctx[:, None, :].expand(-1, N, -1)], -1)).squeeze(-1).float())
-        return {"log_price": price.float(), "prim_w": prim_w, "kappa": kappa, "residual": resid}
+        M = y.shape[1]
+        u = cfg.u_max * torch.tanh(self.price_head(
+            torch.cat([y, ctx[:, None, :].expand(-1, M, -1)], -1)).squeeze(-1).float())
+        u = u - u.mean(1, keepdim=True)
+        alpha = (0.5 + 2.0 * torch.sigmoid(self.scalar_head(ctx).float()[:, 0])
+                 if self.scalar_head is not None else torch.ones_like(u[:, 0]))
+        return {"u": u, "alpha": alpha}
 
 
 # ======================================================================================
 # Low-level weak decoder (parameter-free, interpretable)
 # ======================================================================================
 class WeakDecoder:
+    """Pure transparent T1 scorer; owns no trainable parameters or item embeddings."""
+
     def __init__(self, model_cfg, env_cfg):
-        self.prims = list(model_cfg.primitives)
         self.price_floor = model_cfg.price_floor
-        self.mode = getattr(env_cfg, "feasibility_mode", "perceive")
+        self.mode = getattr(env_cfg, "feasibility_mode", "hard_mask")
         self.beta = getattr(env_cfg, "soft_mask_beta", 5.0)
+        if self.mode not in ("hard_mask", "perceive", "soft_mask"):
+            raise ValueError(f"Unknown feasibility mode: {self.mode}")
 
-    @staticmethod
-    def _z(x, valid):
-        w = valid.float()
-        cnt = w.sum(1, keepdim=True).clamp_min(1.0)
-        mean = (x * w).sum(1, keepdim=True) / cnt
-        var = (((x - mean) ** 2) * w).sum(1, keepdim=True).div(cnt)
-        std = (var + 1e-8).sqrt()                          # +eps: finite grad when var == 0
-        return ((x - mean) / (std + 1e-6)).clamp(-5, 5)
-
-    def primitives(self, st: MKPState, lam: torch.Tensor) -> Dict[str, torch.Tensor]:
-        p, r, c = st.inst.p, st.inst.r, st.inst.c
-        crem = st.c_rem.clamp_min(0.0)
-        logp = torch.log(p.clamp_min(_EPS))
-        out = {}
-        if "profit" in self.prims:
-            out["profit"] = logp
-        if "efficiency" in self.prims:
-            out["efficiency"] = logp - torch.log((r / c[:, :, None]).sum(1).clamp_min(_EPS))
-        if "price_ratio" in self.prims:
-            cost = torch.einsum("bm,bmn->bn", lam, r / (crem[:, :, None] + 1.0))
-            out["price_ratio"] = logp - torch.log(cost.clamp_min(1e-9))
-        if "slack" in self.prims:
-            out["slack"] = ((crem[:, :, None] - r) / c[:, :, None]).min(1).values.clamp(-1, 1)
-        return out
-
-    def __call__(self, st: MKPState, strat: Dict[str, torch.Tensor]):
-        avail = st.available
-        mu = st.mu
-        base = mu + self.price_floor * mu.mean(1, keepdim=True) + 1e-6
-        lam = base * torch.exp(strat["log_price"])
-        prim = self.primitives(st, lam)
-        z = torch.stack([self._z(prim[k], avail) for k in self.prims], dim=-1)   # (B,N,K)
-        score = strat["kappa"][:, None] * (z * strat["prim_w"][:, None, :]).sum(-1) + strat["residual"]
-        if self.mode == "soft_mask":                           # ablation: soft penalty on overflow
+    def __call__(self, st: MKPState, theta: Dict[str, torch.Tensor]):
+        base = st.mu + self.price_floor * st.mu.mean(1, keepdim=True) + 1e-6
+        lam = base * theta["u"].exp()
+        cost = torch.einsum("bm,bmn->bn", lam, st.inst.r / (st.c_rem[:, :, None] + 1.0))
+        p_norm = st.inst.p / st.inst.p.mean(1, keepdim=True).clamp_min(_EPS)
+        score = theta["alpha"][:, None] * p_norm.clamp_min(_EPS).log() - cost.clamp_min(1e-9).log()
+        if self.mode == "soft_mask":
             over = (st.inst.r - st.c_rem[:, :, None]).clamp_min(0) / (st.inst.r + 1.0)
-            viol = over.max(1).values                          # in [0,1), >0 iff infeasible
+            viol = over.max(1).values
             score = score - self.beta * ((viol > 0).float() + viol)
-        elif self.mode == "hard_mask":
-            score = score.masked_fill(~st.fits, NEG)
-        score = score.masked_fill(~avail, NEG)                # structural: processed items
-        score = torch.where(st.done[:, None], torch.zeros_like(score), score)
-        return score, lam
+        valid = st.fits if self.mode == "hard_mask" else st.available
+        score = score.masked_fill(~valid, NEG)
+        # Finished rows are no-ops; avoid a fully masked softmax in a mixed batch.
+        return torch.where(st.done[:, None], torch.zeros_like(score), score), lam
 
 
-# ======================================================================================
-# Full policy
-# ======================================================================================
 class ConstrainedMKPPolicy(nn.Module):
     def __init__(self, cfg):
-        """cfg: full Config (uses cfg.model and cfg.env)."""
         super().__init__()
         self.mcfg, self.ecfg = cfg.model, cfg.env
+        if cfg.model.price_anchor != "root":
+            raise ValueError("T1 supports root price_anchor only; residual LP belongs to T3")
+        if cfg.model.theta_update not in ("step", "static"):
+            raise ValueError("theta_update must be step or static")
+        if cfg.model.temperature_mode not in ("learned", "fixed"):
+            raise ValueError("temperature_mode must be learned or fixed")
+        if not math.isfinite(cfg.model.temperature_init) or cfg.model.temperature_init <= 0:
+            raise ValueError("temperature_init must be positive and finite")
+        if not math.isfinite(cfg.model.u_max) or cfg.model.u_max < 0:
+            raise ValueError("u_max must be finite and nonnegative")
         self.encoder = StateEncoder(cfg.model)
         self.controller = StrategyController(cfg.model)
         self.decoder = WeakDecoder(cfg.model, cfg.env)
+        initial = torch.tensor(math.log(cfg.model.temperature_init), dtype=torch.float32)
+        if cfg.model.temperature_mode == "learned":
+            self.log_temperature = nn.Parameter(initial)
+        else:
+            self.register_buffer("log_temperature", initial)
 
-    # one decision step: dynamic fusion + controller (checkpoint-able, no randomness)
+    @property
+    def temperature(self):
+        return self.log_temperature.exp().clamp_min(1e-6)
+
+    @staticmethod
+    def fixed_theta(st: MKPState):
+        return {"u": torch.zeros_like(st.mu), "alpha": torch.ones_like(st.profit)}
+
     def _step_core(self, x_s, y_s, edge_s, item_d, res_d, edge_d, glob, avail):
         x, y, g = self.encoder.fuse_dynamic(x_s, y_s, item_d, res_d, glob)
-        edge = torch.cat([edge_s, edge_d], dim=-1)     # static + per-step consumption features
-        strat = self.controller(x, y, g, edge, avail)
-        return strat["log_price"], strat["prim_w"], strat["kappa"], strat["residual"]
+        theta = self.controller(x, y, g, torch.cat([edge_s, edge_d], dim=-1), avail)
+        return theta["u"], theta["alpha"]
 
     def forward(self, env: MKPEnv, inst: MKPInstances, num_samples: int = 1,
                 decode: str = "sample", temperature: float = 1.0, amp: bool = False,
-                pre: Optional[tuple] = None, return_trace: bool = False):
-        """Roll out `num_samples` trajectories per instance.
+                pre: Optional[tuple] = None, return_trace: bool = False,
+                theta_override=None):
+        """Construct feasible maximal solutions, with one trajectory for primary greedy.
 
-        Returns dict with reward, profit, n_reject, log_likelihood, entropy (all (B*K,)),
-        solution (B*K, N), ub, steps, and mean strategy statistics.
+        theta_override='fixed' skips the network entirely. A dict supplies explicit
+        u(B,M) and alpha(B,) coefficients, repeated across samples when needed.
+        Static training computes theta at t=0 and retains its computation graph.
         """
-        dev = inst.p.device
-        amp_ctx = (torch.autocast("cuda", dtype=torch.bfloat16)
-                   if (amp and dev.type == "cuda") else nullcontext())
+        if num_samples < 1 or decode not in ("sample", "greedy"):
+            raise ValueError("num_samples >= 1 and decode in {sample,greedy} required")
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("sample temperature must be positive and finite")
+        if isinstance(theta_override, str) and theta_override != "fixed":
+            raise ValueError("Only the 'fixed' theta override is supported")
+        dev, original_B, K = inst.p.device, inst.B, num_samples
+        def autocast_context():
+            return (torch.autocast("cuda", dtype=torch.bfloat16)
+                    if amp and dev.type == "cuda" else nullcontext())
         mu, ub = pre if pre is not None else env.precompute(inst)
-        item_s, res_s, edge_s = env.static_features(inst, mu, ub)
-        with amp_ctx:
-            x_s, y_s = self.encoder.encode_static(item_s, res_s, edge_s)
-        K = num_samples
+        x_s = y_s = edge_s = None
+        if theta_override is None:
+            item_s, res_s, edge_s = env.static_features(inst, mu, ub)
+            with autocast_context():
+                x_s, y_s = self.encoder.encode_static(item_s, res_s, edge_s)
         if K > 1:
             rep = lambda t: t.repeat_interleave(K, 0)
-            x_s, y_s, edge_s = rep(x_s), rep(y_s), rep(edge_s)
+            if theta_override is None:
+                x_s, y_s, edge_s = rep(x_s), rep(y_s), rep(edge_s)
             inst, mu, ub = inst.repeat(K), rep(mu), rep(ub)
         st = env.reset(inst, mu, ub)
-        BK = inst.B
-        logp_sum = torch.zeros(BK, device=dev)
-        ent_sum = torch.zeros(BK, device=dev)
-        n_dec = torch.zeros(BK, device=dev)
-        stats = {"kappa": 0.0, "prim_w": 0.0, "abs_residual": 0.0, "log_price_abs": 0.0}
+        theta_static = None
+        if theta_override is not None:
+            if isinstance(theta_override, str):
+                theta_static = self.fixed_theta(st)
+            elif isinstance(theta_override, dict) and set(theta_override) == {"u", "alpha"}:
+                theta_static = {}
+                for name, value in theta_override.items():
+                    value = torch.as_tensor(value, dtype=torch.float32, device=dev)
+                    if K > 1 and value.shape[0] == original_B:
+                        value = value.repeat_interleave(K, 0)
+                    theta_static[name] = value
+                if theta_static["u"].shape != (inst.B, inst.M) or theta_static["alpha"].shape != (inst.B,):
+                    raise ValueError("theta_override must have u(B,M) and alpha(B,) shapes")
+                if not all(bool(v.isfinite().all()) for v in theta_static.values()):
+                    raise ValueError("theta_override must be finite")
+                if not torch.allclose(theta_static["u"].mean(1), torch.zeros(inst.B, device=dev), atol=1e-5):
+                    raise ValueError("theta_override u must be centered")
+                span = theta_static["u"].amax(1) - theta_static["u"].amin(1)
+                if bool((span > 2 * self.mcfg.u_max + 1e-5).any()):
+                    raise ValueError("theta_override u exceeds the centered tanh price range")
+                if bool(((theta_static["alpha"] < 0.5) | (theta_static["alpha"] > 2.5)).any()):
+                    raise ValueError("theta_override alpha must lie in [0.5,2.5]")
+            else:
+                raise ValueError("theta_override must be 'fixed' or a u/alpha dict")
+        logp_sum = torch.zeros(inst.B, device=dev)
+        ent_sum, n_dec = torch.zeros_like(logp_sum), torch.zeros_like(logp_sum)
+        stats = {"u_abs_mean": 0.0, "alpha_mean": 0.0}
         n_stat = 0
         trace = [] if return_trace else None
         use_ckpt = self.training and self.mcfg.grad_checkpoint and torch.is_grad_enabled()
+        # All arms share the same initial global T; fixed never reads learned parameters.
+        global_T = (torch.tensor(self.mcfg.temperature_init, device=dev)
+                    if theta_override is not None else self.temperature)
 
         while not bool(st.done.all()):
-            item_d, res_d, edge_d, glob = env.dynamic_features(st)
-            avail = st.available
-            with amp_ctx:
-                if use_ckpt:
-                    out = checkpoint(self._step_core, x_s, y_s, edge_s, item_d, res_d, edge_d, glob,
-                                     avail, use_reentrant=False)
-                else:
-                    out = self._step_core(x_s, y_s, edge_s, item_d, res_d, edge_d, glob, avail)
-            strat = dict(zip(("log_price", "prim_w", "kappa", "residual"), out))
-            logits, lam = self.decoder(st, strat)
-            logits = logits.float()
-            if decode == "greedy":
-                logp_all = torch.log_softmax(logits, -1)
-                action = logits.argmax(-1)
+            if theta_static is None:
+                item_d, res_d, edge_d, glob = env.dynamic_features(st)
+                with autocast_context():
+                    args = (x_s, y_s, edge_s, item_d, res_d, edge_d, glob, st.available)
+                    values = (checkpoint(self._step_core, *args, use_reentrant=False)
+                              if use_ckpt else self._step_core(*args))
+                theta = dict(zip(("u", "alpha"), values))
+                if self.mcfg.theta_update == "static":
+                    theta_static = theta
             else:
-                logp_all = torch.log_softmax(logits / temperature, -1)
-                action = torch.multinomial(logp_all.exp(), 1).squeeze(-1)
+                theta = theta_static
+            logits, lam = self.decoder(st, theta)
+            valid = st.fits if self.decoder.mode == "hard_mask" else st.available
+            if not bool(torch.isfinite(logits[valid]).all()):
+                raise FloatingPointError("Non-finite scores on candidate items")
+            # T is global, not a state-level control coefficient; greedy ranking ignores T.
+            finite = torch.isfinite(logits)
+            scaled = (logits.float().masked_fill(~finite, 0.0) / (global_T * temperature))
+            scaled = scaled.masked_fill(~finite, NEG)
+            logp_all = torch.log_softmax(scaled, -1)
+            action = (logits.argmax(-1) if decode == "greedy" else
+                      torch.multinomial(logp_all.exp(), 1).squeeze(-1))
             active = (~st.done).float()
             logp_sum = logp_sum + logp_all.gather(1, action[:, None]).squeeze(1) * active
-            ent = -(logp_all.exp() * logp_all).sum(-1)
-            ent_sum = ent_sum + ent * active
+            # Mask BEFORE multiplication to keep -inf entries out of entropy gradients.
+            safe_logp = logp_all.masked_fill(~torch.isfinite(logp_all), 0.0)
+            ent_sum = ent_sum - (logp_all.exp() * safe_logp).sum(-1) * active
             n_dec = n_dec + active
-            with torch.no_grad():                               # strategy statistics (no sync)
+            with torch.no_grad():
                 n_act = active.sum().clamp_min(1.0)
-                stats["kappa"] = stats["kappa"] + (strat["kappa"] * active).sum() / n_act
-                stats["prim_w"] = stats["prim_w"] + (strat["prim_w"] * active[:, None]).sum(0) / n_act
-                af = avail.float()
-                stats["abs_residual"] = stats["abs_residual"] + (strat["residual"].abs() * af).sum() / af.sum().clamp_min(1.0)
-                stats["log_price_abs"] = stats["log_price_abs"] + strat["log_price"].abs().mean()
+                stats["u_abs_mean"] += (theta["u"].abs().mean(1) * active).sum() / n_act
+                stats["alpha_mean"] += (theta["alpha"] * active).sum() / n_act
                 n_stat += 1
                 if return_trace:
-                    trace.append({"action": action.detach().cpu(), "kappa": strat["kappa"].detach().cpu(),
-                                  "prim_w": strat["prim_w"].detach().cpu(), "lambda": lam.detach().cpu(),
+                    trace.append({"action": action.detach().cpu(), "active": active.bool().cpu(),
+                                  "u": theta["u"].detach().cpu(), "alpha": theta["alpha"].detach().cpu(),
+                                  "temperature": global_T.detach().expand(inst.B).cpu(),
+                                  "lambda": lam.detach().cpu(),
                                   "fits_before": st.fits.gather(1, action[:, None]).squeeze(1).cpu()})
             st = env.step(st, action)
-
-        n_stat = max(n_stat, 1)
-        out = {
-            "reward": env.get_reward(st),
-            "profit": st.profit,
-            "n_reject": st.n_reject,
-            "log_likelihood": logp_sum,
-            "entropy": ent_sum / n_dec.clamp_min(1.0),
-            "solution": st.solution,
-            "ub": st.ub,
-            "steps": st.t,
-            "kappa": float(stats["kappa"] / n_stat),
-            "prim_w": (stats["prim_w"] / n_stat).tolist() if torch.is_tensor(stats["prim_w"]) else None,
-            "abs_residual": float(stats["abs_residual"] / n_stat),
-            "log_price_abs": float(stats["log_price_abs"] / n_stat),
-            "primitives": list(self.mcfg.primitives),
-        }
+        out = {"reward": env.get_reward(st), "profit": st.profit, "n_reject": st.n_reject,
+               "log_likelihood": logp_sum, "entropy": ent_sum / n_dec.clamp_min(1),
+               "solution": st.solution, "ub": st.ub, "steps": st.t,
+               "u_abs_mean": float(stats["u_abs_mean"] / max(n_stat, 1)),
+               "alpha_mean": float(stats["alpha_mean"] / max(n_stat, 1)),
+               "temperature": float(global_T.detach()),
+               "theta_dim": inst.M + int("alpha" in self.mcfg.theta_groups)}
         if return_trace:
             out["trace"] = trace
         return out

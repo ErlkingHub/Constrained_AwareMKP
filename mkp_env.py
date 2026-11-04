@@ -11,19 +11,15 @@ project dependency-light and fast (no TensorDict / Lightning needed).
 
 Episode
 -------
-At every step the agent picks ONE not-yet-processed item.
+The main policy uses a hard feasibility mask and picks ONE currently fitting item.
   * fits    -> item is packed, remaining capacities shrink, profit is collected
-  * no fit  -> item is *rejected* (discarded, capacities untouched) and counted as a
-               constraint violation attempt (penalised in the reward).
+The separately named rejection-mode ablation may also pick an infeasible item, which is
+discarded with capacities untouched and counted as a rejected attempt.
 The episode ends when no unprocessed item fits any more (or every item is processed).
 
-Why no feasibility mask is required (see README):
-capacities are monotonically non-increasing, so an item that does not fit now can never fit
-later. Discarding it is therefore loss-free for the final objective, and the solution is
-feasible by construction. The agent, however, must *perceive* feasibility from the state
-(it is given continuous slack / load features, never a hard filter) to avoid wasted steps
-and penalties. Only already-processed items are excluded from the choice set, which is a
-structural "visited" mask, not a constraint mask.
+Capacities are monotonically non-increasing, so an item that does not fit now can never fit
+later. Every completed rollout is feasible and maximal. The main reward is profit / LP
+upper bound; rejection penalties apply only to the rejection-mode ablations.
 
 Observation = (static item/resource/edge features, dynamic item/resource/edge features,
 global features); all features are scale-free so the policy transfers across N, M and the
@@ -190,6 +186,7 @@ class MKPEnv:
         self.cfg = env_cfg
         self.dual_iters = getattr(env_cfg, "dual_iters", 300)
         self.dual_lr = getattr(env_cfg, "dual_lr", 0.05)
+        self.feasibility_mode = getattr(env_cfg, "feasibility_mode", "hard_mask")
         self.reject_penalty = getattr(env_cfg, "reject_penalty", 0.05)
 
     # ------------------------------------------------------------------ generator
@@ -248,9 +245,11 @@ class MKPEnv:
         return st
 
     def get_reward(self, st: MKPState) -> torch.Tensor:
-        """Normalised reward: profit / LP-bound  -  penalty * (#rejected) / N."""
-        N = st.inst.N
-        return st.profit / st.ub.clamp_min(_EPS) - self.reject_penalty * st.n_reject / N
+        """Profit / LP-bound; only the rejection ablations include a reject penalty."""
+        reward = st.profit / st.ub.clamp_min(_EPS)
+        if self.feasibility_mode != "hard_mask":
+            reward = reward - self.reject_penalty * st.n_reject / st.inst.N
+        return reward
 
     # ------------------------------------------------------------------ observations
     @staticmethod
