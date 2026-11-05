@@ -42,6 +42,32 @@ def _audit(solution, inst):
         raise RuntimeError("Non-maximal benchmark solution")
 
 
+def _decision_statistics(traces):
+    """Summarize active trajectories at controller decision points, not held steps."""
+    u_sum, u_count, alpha_sum, alpha_sq, decisions, gamma_sum, gamma_count = 0., 0, 0., 0., 0, 0., 0
+    for trace in traces:
+        for step in trace:
+            if not step.get("theta_decision", True) or "u" not in step or "alpha" not in step:
+                continue
+            u, alpha = torch.as_tensor(step["u"]), torch.as_tensor(step["alpha"])
+            active = torch.as_tensor(step.get("active", torch.ones(alpha.shape, dtype=torch.bool))).bool()
+            u, alpha = u[active], alpha[active]
+            u_sum += float(u.abs().sum())
+            u_count += u.numel()
+            alpha_sum += float(alpha.sum())
+            alpha_sq += float(alpha.square().sum())
+            decisions += alpha.numel()
+            if "gamma" in step:
+                gamma = torch.as_tensor(step["gamma"])[active]
+                gamma_sum += float(gamma.sum())
+                gamma_count += gamma.numel()
+    alpha_mean = alpha_sum / max(decisions, 1)
+    return {"theta_decisions": decisions, "decision_u_abs_mean": u_sum / max(u_count, 1),
+            "decision_alpha_mean": alpha_mean,
+            "decision_alpha_std": math.sqrt(max(0., alpha_sq / max(decisions, 1) - alpha_mean ** 2)),
+            "decision_gamma_mean": gamma_sum / gamma_count if gamma_count else ""}
+
+
 @torch.no_grad()
 def _historical_rollout(env, inst, pre, k, decode, temperature):
     """Historical static-c ratio, plus an explicitly named stochastic extension."""
@@ -68,7 +94,7 @@ def evaluate_stage(model, env, inst, ec, device, amp, pre, stage, arm, seed, ins
     set_seed(rng_seed)
     gen = torch.Generator(device="cpu").manual_seed(rng_seed)
     mu, ub = pre
-    sols, objs = [], []
+    sols, objs, traces = [], [], []
     _sync(device)
     start, remaining, offset, artifact_seconds = time.perf_counter(), spec["budget"], 0, 0.0
     while remaining:
@@ -82,6 +108,7 @@ def evaluate_stage(model, env, inst, ec, device, amp, pre, stage, arm, seed, ins
                         return_trace=True, **kwargs)
         sols.append(out["solution"])
         objs.append(out["profit"])
+        traces.append(out.get("trace", []))
         if artifact_sink is not None:
             _sync(device)
             astart = time.perf_counter()
@@ -94,6 +121,7 @@ def evaluate_stage(model, env, inst, ec, device, amp, pre, stage, arm, seed, ins
     _sync(device)
     construction_seconds = time.perf_counter() - start - artifact_seconds
     solution, objective = torch.cat(sols), torch.cat(objs)
+    theta_stats = _decision_statistics(traces)
     _audit(solution, inst)
     idx = int(objective.argmax())
     best_solution, best_obj = solution[idx:idx + 1], float(objective[idx])
@@ -132,7 +160,8 @@ def evaluate_stage(model, env, inst, ec, device, amp, pre, stage, arm, seed, ins
             "ls_drop_k": ec.ls_drop_k if spec["refine"] else 0,
             "ils_perturb_max": ec.ils_perturb_max if spec["refine"] else 0,
             "sample_temperature": ec.sample_temperature, "rng_seed": rng_seed,
-            "solution": best_solution[0].to(torch.int8).cpu().tolist(), "feasible": True, "maximal": True}
+            "solution": best_solution[0].to(torch.int8).cpu().tolist(), "feasible": True, "maximal": True,
+            **theta_stats}
 
 
 def _load_arms(cfg, arms, checkpoint, static_checkpoint, device):
@@ -156,7 +185,7 @@ def _load_arms(cfg, arms, checkpoint, static_checkpoint, device):
                 raise ValueError("Matched arms must use the same training seed")
             lhs, rhs = reference_cfg.to_dict(), mc.to_dict()
             for conf in (lhs, rhs):
-                for key in ("theta_update", "untrained_random_heads"):
+                for key in ("theta_update", "theta_interval", "untrained_random_heads"):
                     conf["model"].pop(key, None)
             if lhs["model"] != rhs["model"] or lhs["env"] != rhs["env"]:
                 raise ValueError("Matched checkpoints must share encoder, theta groups and executor")
@@ -175,6 +204,7 @@ def _load_arms(cfg, arms, checkpoint, static_checkpoint, device):
         # The untrained primary control always uses per-step theta, independent
         # of the order in which static/dynamic checkpoints were requested.
         mc.model.theta_update = "step"
+        mc.model.theta_interval = 1
         mc.model.untrained_random_heads = name == "untrained"
         set_seed(training_seed)
         models[name] = None if name == "fixed_dualgreedy" else build_model(mc).to(device).eval()
@@ -184,14 +214,26 @@ def _load_arms(cfg, arms, checkpoint, static_checkpoint, device):
     return models, configs, checkpoints, training_seed
 
 
-def protocol_sha256(cfg):
+def _protocol(cfg, include_schedule):
     model = cfg.to_dict()["model"]
-    for key in ("theta_update", "untrained_random_heads"):
+    omitted = () if include_schedule else ("theta_update", "theta_interval", "untrained_random_heads")
+    for key in omitted:
         model.pop(key, None)
-    protocol = {"formula": "weak_decoder_t1r_zscore_v1" if cfg.model.score_normalization else "weak_decoder_t1_g0g1_v1", "model": model, "env": cfg.to_dict()["env"],
+    return {"formula": "weak_decoder_t2_block_v1" if "block" in cfg.model.theta_groups else
+                ("weak_decoder_t1r_zscore_v1" if cfg.model.score_normalization else "weak_decoder_t1_g0g1_v1"),
+                "model": model, "env": cfg.to_dict()["env"],
                 "sampling": "exact-K-excluding-greedy", "search": "top-pool-retaining-duplicates",
                 "global_temperature": "initial-for-controls-fitted-for-learned"}
-    return hashlib.sha256(json.dumps(protocol, sort_keys=True).encode()).hexdigest()
+
+
+def protocol_sha256(cfg):
+    """Comparison signature (historical helper API): allow the declared schedule ablation."""
+    return hashlib.sha256(json.dumps(_protocol(cfg, include_schedule=False), sort_keys=True).encode()).hexdigest()
+
+
+def arm_protocol_sha256(cfg):
+    """Full method signature, including checkpoint-defined theta_update and interval."""
+    return hashlib.sha256(json.dumps(_protocol(cfg, include_schedule=True), sort_keys=True).encode()).hexdigest()
 
 
 def main(argv=None):
@@ -209,6 +251,11 @@ def main(argv=None):
     arms = ["fixed_dualgreedy"] if args.baseline_only else args.arm.split(",")
     if not arms or len(set(arms)) != len(arms) or any(a not in ARMS for a in arms):
         raise ValueError(f"--arm must be a unique subset of {ARMS}")
+    if any(arg.split("=", 1)[0] == "--model.theta_interval" for arg in overrides):
+        if args.checkpoint or args.static_checkpoint or any(a.startswith("learned_") for a in arms):
+            raise ValueError("theta_interval is inherited from each checkpoint; inference overrides are not allowed")
+        if cfg.model.theta_interval != 1:
+            raise ValueError("The fixed/untrained controls use theta_interval=1")
     stages = [s["name"] for s in parse_stages(args.stages.split(","), cfg.eval.num_samples)]
     stages.sort(key=lambda name: name != "greedy")
     if args.print_config:
@@ -250,23 +297,32 @@ def main(argv=None):
             "dataset": path, "data_sha256": sha256_file(path), "instance_ids": [d["id"] for d in data],
             "checkpoints": checkpoints, "training_seed": training_seed,
             "evaluation_seed": cfg.device.seed, "arms": arms, "stages": stages,
-            "protocol_sha256": {a: protocol_sha256(configs[a]) for a in arms},
+            "protocol_sha256": {a: arm_protocol_sha256(configs[a]) for a in arms},
+            "comparison_protocol_sha256": {a: protocol_sha256(configs[a]) for a in arms},
+            "theta_schedules": {a: {"theta_update": configs[a].model.theta_update,
+                                     "theta_interval": configs[a].model.theta_interval} for a in arms},
             "device": str(device), "amp": cfg.device.amp and device.type == "cuda", "primary_stage": "greedy",
             "primary_stage_evaluated": "greedy" in stages,
             "reference": "Chu best-known values; not proven optima",
             "timing": "GPU synchronized; root LP shared per instance, charged once to each arm/stage. "
-                      "Construction includes per-step theta trace capture/CPU copies. JSON serialization, "
-                      "artifact output, audits and model loading excluded.",
+                      "Construction includes per-step theta trace capture/CPU copies. Decision-point theta "
+                      "statistics, JSON serialization, artifact output, audits and model loading excluded.",
             "protocol": "sampleK is K samples excluding greedy. ILS retains duplicate starts for matched budgets. "
                         "Stage RNG resets by evaluation seed, instance ID and stage, independently of arm.",
+            "schedule_comparison": "Each learned arm inherits its trained theta_interval without an inference "
+                                   "override. Full protocol SHA includes update mode and interval. Comparison "
+                                   "SHA excludes only theta_update, theta_interval and untrained_random_heads "
+                                   "to permit the declared static/dynamic control comparison; paired reports "
+                                   "retain both full SHAs and schedules. Fixed/untrained controls use k=1.",
             "historical_reference": "fixed_dualgreedy uses static capacities/root dual. Its sampling extension "
                                     "softmaxes log ratio; this arm is not a matched-executor control.",
             "shared_beta_override": args.beta,
             "temperature_control": "Fixed-mode normalized checkpoints share configured beta; --beta overrides every arm. Learned-mode comparisons: fixed/untrained use the configured initial global T; learned arms use "
                                    "their fitted global T. Greedy is invariant to T. Sampling comparisons "
                                    "therefore include the effect of learning a global temperature.",
-            "evidence": "One training seed per invocation. Combine >=3 independent training seeds with "
-                        "mkp_evaluation.py --inputs. This evaluator never selects weights."}
+            "evidence": "One training seed per invocation; current T1-P protocol specifies seed 1234. "
+                        "Wilcoxon pairs are instances within this seed, not evidence across training seeds. "
+                        "This evaluator never selects weights."}
     write_json(out_dir / "meta.json", meta)
     rows = []
     try:
@@ -289,6 +345,10 @@ def main(argv=None):
                         row = {"id": d["id"], "M": d["M"], "N": d["N"], "alpha": alpha,
                                "arm": arm, "seed": training_seed, "evaluation_seed": cfg.device.seed,
                                "data_sha256": meta["data_sha256"], "protocol_sha256": meta["protocol_sha256"][arm],
+                               "comparison_protocol_sha256": meta["comparison_protocol_sha256"][arm],
+                               "theta_update": configs[arm].model.theta_update,
+                               "theta_interval": configs[arm].model.theta_interval,
+                               "training_signal": configs[arm].train.signal if arm.startswith("learned_") else "none",
                                "best_known": float(d["best"]), **rec}
                         row["gap_pct"] = (row["best_known"] - rec["objective"]) / row["best_known"] * 100
                         rows.append(row)

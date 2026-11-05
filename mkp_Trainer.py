@@ -7,11 +7,13 @@ For each training instance K trajectories are sampled; the baseline of a traject
 mean reward of the K trajectories of the same instance, so no critic network is needed:
 
     A_k = R_k - mean_k' R_k'          (optionally divided by the batch std)
-    L   = - E[ A_k * log pi(tau_k) ] - entropy_coef * H
+    item_pg : L = - E[A_k * log pi(tau_k)] - entropy_coef * H
+    theta_pg: L = - E[A_k * sum_decisions log q(theta)] (greedy executor, fixed sigma)
 
 Reward (hard-mask main method): profit / LP-bound.
 
-Logs   : runs/<timestamp>/{config.json, log.txt, train_log.csv, val_log.csv, tensorboard events}
+Logs   : runs/<timestamp>/{config.json, log.txt, train_log.csv, val_log.csv, epoch_log.csv,
+                          tensorboard events}
 Ckpts  : checkpoints/<timestamp>/{last.pt, best.pt}  and  checkpoints/{last.pt, best.pt}
          (the latter two are what Benchmark_zeroShot.py loads by default)
 """
@@ -43,6 +45,9 @@ def _check_checkpoint(ck, expected_model=None):
     """Reject legacy item-residual models instead of silently discarding config fields."""
     model_cfg = dict(ck.get("config", {}).get("model", {}))
     model_cfg.setdefault("score_normalization", False)
+    model_cfg.setdefault("theta_interval", 1)
+    model_cfg.setdefault("block_gamma_init", 0.1)
+    model_cfg.setdefault("block_chunk_size", 64)
     legacy = {"residual_max", "primitives", "init_primitive", "init_primitive_logit",
               "kappa_init", "kappa_min", "price_log_range"}.intersection(model_cfg)
     legacy_weights = any(any(part in key for part in ("res_head", "prim_head", "kappa_head"))
@@ -58,6 +63,21 @@ def _check_checkpoint(ck, expected_model=None):
         if differences:
             raise ValueError("Checkpoint model config differs from requested training config: " +
                              ", ".join(differences))
+
+
+def _training_contract(values):
+    """Old checkpoints predate theta-space sampling and therefore mean item_pg."""
+    signal = values.get("signal", "item_pg")
+    contract = {"signal": signal, "num_samples": values.get("num_samples", 16),
+                "adv_normalize": values.get("adv_normalize", True)}
+    if signal == "theta_pg":
+        contract.update({"theta_pg_sigma_u": values.get("theta_pg_sigma_u", 0.05),
+                         "theta_pg_sigma_alpha": values.get("theta_pg_sigma_alpha", 0.3),
+                         "theta_pg_sigma_gamma": values.get("theta_pg_sigma_gamma", 0.3),
+                         "theta_pg_antithetic": values.get("theta_pg_antithetic", True)})
+    else:
+        contract["entropy_coef"] = values.get("entropy_coef", 0.01)
+    return contract
 
 
 def set_seed(seed: int):
@@ -93,6 +113,14 @@ class MKPTrainer:
     def __init__(self, cfg: Config, device: torch.device):
         self.cfg, self.device = cfg, device
         tc = cfg.train
+        if tc.signal not in ("item_pg", "theta_pg"):
+            raise ValueError("train.signal must be item_pg or theta_pg")
+        if tc.signal == "theta_pg":
+            for name in ("theta_pg_sigma_u", "theta_pg_sigma_alpha", "theta_pg_sigma_gamma"):
+                if not math.isfinite(getattr(tc, name)) or getattr(tc, name) <= 0:
+                    raise ValueError(f"train.{name} must be positive and finite")
+            if tc.theta_pg_antithetic and tc.num_samples % 2:
+                raise ValueError("Antithetic theta_pg requires an even num_samples")
         if tc.batch_size < 1 or tc.num_samples < 2 or tc.steps_per_epoch < 1:
             raise ValueError("REINFORCE needs batch_size>=1, num_samples>=2 and steps_per_epoch>=1")
         if tc.val_instances < 1 or not tc.val_sizes or not tc.val_dims or tc.val_every < 1:
@@ -123,6 +151,7 @@ class MKPTrainer:
 
         self.train_csv = _CSVLogger(os.path.join(self.run_dir, "train_log.csv"))
         self.val_csv = _CSVLogger(os.path.join(self.run_dir, "val_log.csv"))
+        self.epoch_csv = _CSVLogger(os.path.join(self.run_dir, "epoch_log.csv"))
         self.tb = None
         try:
             from torch.utils.tensorboard import SummaryWriter
@@ -138,6 +167,7 @@ class MKPTrainer:
         write_json(os.path.join(self.run_dir, "meta.json"), {
             "schema": CHECKPOINT_SCHEMA, "config": cfg.to_dict(), "source": self.source,
             "seed": cfg.device.seed, "selection_rule": self.selection_rule,
+            "training_contract": _training_contract(vars(tc)),
             "validation_manifest": self.validation_manifest,
             "inherited_best": self.inherited_best,
             "resume": self._input_checkpoint_meta(tc.resume),
@@ -208,6 +238,7 @@ class MKPTrainer:
                 "global_step": self.global_step, "best_val": self.best_val,
                 "config": self.cfg.to_dict(), "run_name": self.run_name,
                 "selection_rule": self.selection_rule, "source": self.source,
+                "training_contract": _training_contract(vars(self.cfg.train)),
                 "validation_manifest": self.validation_manifest,
                 "inherited_best": self.inherited_best,
                 "initial_gap": self.initial_gap, "gate_gaps": self.gate_gaps,
@@ -222,6 +253,7 @@ class MKPTrainer:
         shutil.copyfile(last, os.path.join(self.ckpt_root, "last.pt"))
         meta = {"schema": CHECKPOINT_SCHEMA, "sha256": sha256_file(last), "epoch": self.epoch,
                 "global_step": self.global_step, "best_val": self.best_val,
+                "training_contract": _training_contract(vars(self.cfg.train)),
                 "selection_rule": self.selection_rule, "validation_manifest": self.validation_manifest}
         write_json(last + ".meta.json", meta)
         write_json(os.path.join(self.ckpt_root, "last.pt.meta.json"), meta)
@@ -244,7 +276,9 @@ class MKPTrainer:
             same = (selected.get("run_name") == checkpoint.get("run_name") and
                     selected.get("best_val") == checkpoint.get("best_val") and
                     selected.get("epoch", -1) <= checkpoint.get("epoch", -1) and
-                    selected.get("validation_manifest") == checkpoint.get("validation_manifest"))
+                    selected.get("validation_manifest") == checkpoint.get("validation_manifest") and
+                    _training_contract(selected.get("config", {}).get("train", {})) ==
+                    _training_contract(checkpoint.get("config", {}).get("train", {})))
             if not same:
                 raise ValueError("sibling best.pt does not match resumed run/epoch/value/validation")
             digest = sha256_file(candidate)
@@ -275,6 +309,10 @@ class MKPTrainer:
         self.model.load_state_dict(ck["model"])
         if full:
             old_train = ck["config"]["train"]
+            if _training_contract(old_train) != _training_contract(vars(self.cfg.train)):
+                raise ValueError("Resume cannot change the training contract (signal, sample count, "
+                                 "advantage normalization, sigma/antithetic or item entropy); "
+                                 "use train.init_from for a separate experiment")
             selection_fields = ("validation_reference", "val_seed", "val_instances", "val_sizes", "val_dims",
                                 "val_milp_time_limit", "val_mip_rel_gap")
             changed = [name for name in selection_fields if old_train.get(name) != getattr(self.cfg.train, name)]
@@ -318,22 +356,47 @@ class MKPTrainer:
         agg = {"loss": 0.0, "reward": 0.0, "best_reward": 0.0, "gap_ub": 0.0, "reject_rate": 0.0,
                "entropy": 0.0, "u_abs_mean": 0.0, "alpha_mean": 0.0, "temperature": 0.0,
                "alpha_lower_frac": 0.0, "alpha_upper_frac": 0.0, "u_boundary_frac": 0.0, "raw_score_std": 0.0}
+        theta_pg = tc.signal == "theta_pg"
+        if "block" in self.cfg.model.theta_groups:
+            agg["gamma_mean"] = 0.0
+        if theta_pg:
+            agg.update({"R_mean": 0.0, "frac_better": 0.0, "adv_zero_frac": 0.0})
+        noise = ({"sigma_u": tc.theta_pg_sigma_u, "sigma_alpha": tc.theta_pg_sigma_alpha,
+                  "sigma_gamma": tc.theta_pg_sigma_gamma, "antithetic": tc.theta_pg_antithetic}
+                 if theta_pg else None)
         for s in range(0, B, per_chunk):
             e = min(B, s + per_chunk)
             sub = MKPInstances(inst.p[s:e], inst.r[s:e], inst.c[s:e])
-            out = self.model(self.env, sub, num_samples=K, decode="sample", amp=self.amp,
-                             pre=(mu[s:e], ub[s:e]))
+            kwargs = {"theta_noise": noise} if theta_pg else {}
+            out = self.model(self.env, sub, num_samples=K, decode="greedy" if theta_pg else "sample",
+                             amp=self.amp, pre=(mu[s:e], ub[s:e]), **kwargs)
             R = out["reward"].view(e - s, K)
             adv = R - R.mean(1, keepdim=True)
             if tc.adv_normalize:
                 adv = adv / (adv.std() + 1e-8)
-            ll = out["log_likelihood"].view(e - s, K)
-            loss = -(adv.detach() * ll).mean() - tc.entropy_coef * out["entropy"].mean()
+            ll = out["theta_logp" if theta_pg else "log_likelihood"].view(e - s, K)
+            loss = -(adv.detach() * ll).mean()
+            if not theta_pg:
+                loss = loss - tc.entropy_coef * out["entropy"].mean()
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite REINFORCE loss at step {self.global_step}")
             frac = (e - s) / B
             (loss * frac).backward()
             with torch.no_grad():
+                if theta_pg:
+                    # Diagnostics use the current deterministic mean policy, and
+                    # never contribute to the score-function loss or its baseline.
+                    was_training = self.model.training
+                    self.model.eval()
+                    try:
+                        mean_out = self.model(self.env, sub, num_samples=1, decode="greedy", amp=self.amp,
+                                              pre=(mu[s:e], ub[s:e]))
+                    finally:
+                        self.model.train(was_training)
+                    mean_reward = mean_out["reward"].view(e - s)
+                    agg["R_mean"] += mean_reward.mean().item() * frac
+                    agg["frac_better"] += (R > mean_reward[:, None]).float().mean().item() * frac
+                    agg["adv_zero_frac"] += (R.max(1).values == R.min(1).values).float().mean().item() * frac
                 profit = out["profit"].view(e - s, K)
                 ubv = out["ub"].view(e - s, K)
                 agg["loss"] += loss.item() * frac
@@ -344,6 +407,8 @@ class MKPTrainer:
                 agg["entropy"] += out["entropy"].mean().item() * frac
                 for key in ("u_abs_mean", "alpha_mean", "temperature", "alpha_lower_frac", "alpha_upper_frac", "u_boundary_frac", "raw_score_std"):
                     agg[key] += float(out[key]) * frac
+                if "gamma_mean" in agg:
+                    agg["gamma_mean"] += float(out["gamma_mean"]) * frac
         gn = torch.nn.utils.clip_grad_norm_(self.model.parameters(), tc.grad_clip)
         finite_gradients = bool(torch.isfinite(gn))
         if finite_gradients:
@@ -374,14 +439,23 @@ class MKPTrainer:
 
     def fit(self):
         tc = self.cfg.train
-        if tc.gate_early_stop and (tc.val_every != 1 or self.cfg.model.theta_update != "step"):
-            raise ValueError("Gate early stopping requires dynamic theta and validation every epoch")
+        if tc.gate_early_stop and tc.val_every != 1:
+            raise ValueError("Gate early stopping requires validation every epoch")
+        if tc.gate_early_stop and not tc.resume and not tc.initial_validation:
+            raise ValueError("Gate early stopping requires epoch -1 initial validation")
         if not tc.resume and tc.initial_validation:
+            initial_started = time.time()
             val = self.validate()
             self.initial_gap = self.best_val = val["gap_mean"]
             self.val_csv.log({"epoch": -1, "step": 0, **val, "best": self.best_val})
             self.log(f"epoch -1 initialization validation: {val}")
             self.save(True)
+            self.epoch_csv.log({"epoch": -1, "step": 0, "signal": tc.signal,
+                                "R_mean": "", "frac_better": "", "adv_zero_frac": "",
+                                "time_s": time.time() - initial_started,
+                                "val_gap": val["gap_mean"], "best_val": self.best_val})
+        if tc.gate_early_stop and self.initial_gap is None:
+            raise ValueError("Gate early stopping needs a checkpoint with epoch -1 validation")
         start_epoch = self.epoch
         for ep in range(start_epoch, tc.epochs):
             self.epoch = ep
@@ -407,10 +481,15 @@ class MKPTrainer:
                            f"| u_boundary {st['u_boundary_frac']:.3f} | raw_std {st['raw_score_std']:.5f} "
                            f"| T {st['temperature']:.3f} | grad {st['grad_norm']:.3f} "
                            f"| lr {st['lr']:.2e} | {time.time() - t0:.0f}s")
+                    if tc.signal == "theta_pg":
+                        msg += (f" | R_mean {st['R_mean']:.4f} | frac_better {st['frac_better']:.3f} "
+                                f"| adv_zero_frac {st['adv_zero_frac']:.3f}")
                     self.log(msg)
             is_best = False
+            epoch_val = ""
             if (ep + 1) % tc.val_every == 0 or ep == tc.epochs - 1:
                 val = self.validate()
+                epoch_val = val["gap_mean"]
                 is_best = val["gap_mean"] < self.best_val
                 if is_best:
                     self.best_val = val["gap_mean"]
@@ -425,9 +504,14 @@ class MKPTrainer:
             if ep < 4 and tc.gate_early_stop:
                 self.gate_gaps.append(val["gap_mean"])
             self.save(is_best)
+            self.epoch_csv.log({"epoch": ep, "step": self.global_step, "signal": tc.signal,
+                                **{key: run[key] / tc.steps_per_epoch if key in run else ""
+                                   for key in ("R_mean", "frac_better", "adv_zero_frac")},
+                                "time_s": time.time() - t0, "val_gap": epoch_val,
+                                "best_val": self.best_val})
             if tc.gate_early_stop and ep == 3 and self.initial_gap is not None and len(self.gate_gaps) == 4 and all(g > self.initial_gap + tc.gate_margin_pp for g in self.gate_gaps):
                 write_json(os.path.join(self.run_dir, "early_stop.json"), {"reason": "epochs 0-3 all worse than initialization", "initial_gap": self.initial_gap, "gaps": self.gate_gaps, "margin_pp": tc.gate_margin_pp})
-                self.log("T1-R gate early stop triggered; inspect boundary fractions and raw_score_std in train_log.csv")
+                self.log("Gate early stop triggered; inspect theta diagnostics in train_log.csv and epoch_log.csv")
                 break
         if self.tb is not None:
             self.tb.close()

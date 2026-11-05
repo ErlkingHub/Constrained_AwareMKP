@@ -92,11 +92,14 @@ class ModelConfig:
     # Edge-feature MLP hidden size for the item-resource attention biases.
     edge_hidden: int = 32
 
-    # T1 implements G0+G1 only. Later groups require separately reviewed experiments.
+    # G0+G1 by default; opt-in block group is prepared for gated T2 experiments.
     theta_groups: List[str] = field(default_factory=lambda: ["price", "alpha"])
     price_anchor: str = "root"
     u_max: float = 3.0                   # tanh bound before centering (sum_j u_j = 0)
     theta_update: str = "step"           # step | static (static must be trained separately)
+    theta_interval: int = 1              # decision times 0,k,2k,...; T1-P dynamic uses 8
+    block_gamma_init: float = 0.1
+    block_chunk_size: int = 64
     score_normalization: bool = True    # T1-R feasible-set z-score; old checkpoints retain False
     temperature_mode: str = "fixed"    # one global scalar, independent of state and N
     temperature_init: float = 1.0 / 3.0
@@ -110,6 +113,11 @@ class ModelConfig:
 # --------------------------------------------------------------------------------------
 @dataclass
 class TrainConfig:
+    signal: str = "theta_pg"             # theta_pg | item_pg (legacy checkpoints)
+    theta_pg_sigma_u: float = 0.05
+    theta_pg_sigma_alpha: float = 0.3
+    theta_pg_sigma_gamma: float = 0.3
+    theta_pg_antithetic: bool = True
     initial_validation: bool = True
     gate_early_stop: bool = False
     gate_margin_pp: float = 0.3
@@ -227,6 +235,8 @@ def config_from_dict(d: dict) -> Config:
                 setattr(sub, k, v)
     if d and "model" in d and "score_normalization" not in d["model"]:
         cfg.model.score_normalization = False
+    if d and "signal" not in d.get("train", {}):
+        cfg.train.signal = "item_pg"
     return cfg
 
 

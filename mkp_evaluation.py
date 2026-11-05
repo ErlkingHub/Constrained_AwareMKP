@@ -18,6 +18,14 @@ BUDGET_FIELDS = ("stage", "budget", "search_starts", "ils_rounds", "ls_max_iters
 REPORT_FIELDS = tuple(k for k in BUDGET_FIELDS if k != "evaluation_seed")
 
 
+def _comparison_budget(row):
+    # Old reports stored only one (executor-level) SHA; their existing comparisons
+    # remain valid. New reports carry a full method SHA plus an explicitly named
+    # comparison signature allowing the specified static/dynamic schedule ablation.
+    return tuple(str(row.get("comparison_protocol_sha256", row["protocol_sha256"]))
+                 if key == "protocol_sha256" else str(row[key]) for key in BUDGET_FIELDS)
+
+
 def paired_seed(seed, instance_id, stage, trial=0):
     raw = f"{seed}|{instance_id}|{stage}|{trial}".encode()
     return int.from_bytes(hashlib.sha256(raw).digest()[:4], "little")
@@ -71,11 +79,19 @@ def summarize(rows):
     for key, values in groups.items():
         gap = np.asarray([float(r["gap_pct"]) for r in values])
         item = {"arm": key[0], "seed": key[1], **dict(zip(BUDGET_FIELDS, key[2:2 + len(BUDGET_FIELDS)])),
+                "comparison_protocol_sha256": values[0].get("comparison_protocol_sha256", values[0]["protocol_sha256"]),
+                "theta_update": values[0].get("theta_update", "unspecified"),
+                "theta_interval": values[0].get("theta_interval", 1),
                 "M": key[-3], "N": key[-2], "alpha": key[-1], "count": len(values),
                 "mean_gap_pct": float(gap.mean()), "worst_gap_pct": float(gap.max()),
                 "p90_gap_pct": float(np.quantile(gap, .9))}
         for field in ("time_lp_s", "time_construct_s", "time_refine_s", "time_total_s"):
             item["mean_" + field] = float(np.mean([float(r[field]) for r in values]))
+        for field in ("theta_decisions", "decision_u_abs_mean", "decision_alpha_mean",
+                      "decision_alpha_std", "decision_gamma_mean"):
+            present = [float(r[field]) for r in values if r.get(field) not in (None, "")]
+            if present:
+                item["mean_" + field] = float(np.mean(present))
         output.append(item)
     return output
 
@@ -96,13 +112,14 @@ def paired_report(rows):
     """Pair same instances/seeds/budgets; average seeds before cross-seed instance tests."""
     lookup, cohorts = {}, {}
     for row in rows:
-        cohort = (str(row["seed"]), str(row["id"]), str(row["stage"]), row["data_sha256"], row["protocol_sha256"])
-        budget = tuple(str(row[k]) for k in BUDGET_FIELDS)
+        comparison_sha = row.get("comparison_protocol_sha256", row["protocol_sha256"])
+        cohort = (str(row["seed"]), str(row["id"]), str(row["stage"]), row["data_sha256"], comparison_sha)
+        budget = _comparison_budget(row)
         if cohort in cohorts and cohorts[cohort] != budget:
             raise ValueError(f"Mismatched inference budgets/evaluation seeds for seed={row['seed']}, "
                              f"id={row['id']}, stage={row['stage']}")
         cohorts[cohort] = budget
-        key = (str(row["seed"]), str(row["id"]), *(str(row[k]) for k in BUDGET_FIELDS))
+        key = (str(row["seed"]), str(row["id"]), *budget)
         bucket = lookup.setdefault(key, {})
         if row["arm"] in bucket:
             raise ValueError(f"Duplicate result: arm={row['arm']}, seed={row['seed']}, id={row['id']}, stage={row['stage']}")
@@ -116,18 +133,34 @@ def paired_report(rows):
             pair = {"id": lhs["id"], "seed": lhs["seed"], "M": lhs["M"], "N": lhs["N"],
                     "alpha": lhs["alpha"], "arm": left, "control": right,
                     **{k: lhs[k] for k in BUDGET_FIELDS},
+                    "comparison_protocol_sha256": lhs.get("comparison_protocol_sha256", lhs["protocol_sha256"]),
+                    "control_protocol_sha256": rhs["protocol_sha256"],
+                    "theta_update": lhs.get("theta_update", "unspecified"),
+                    "theta_interval": lhs.get("theta_interval", 1),
+                    "control_theta_update": rhs.get("theta_update", "unspecified"),
+                    "control_theta_interval": rhs.get("theta_interval", 1),
+                    "matched_update_schedule": (lhs.get("theta_update", "unspecified"), str(lhs.get("theta_interval", 1))) ==
+                                               (rhs.get("theta_update", "unspecified"), str(rhs.get("theta_interval", 1))),
                     "gap_delta_pp": float(lhs["gap_pct"]) - float(rhs["gap_pct"]),
                     "objective_delta": float(lhs["objective"]) - float(rhs["objective"]),
                     "time_delta_s": float(lhs["time_total_s"]) - float(rhs["time_total_s"]),
                     "matched_executor": "fixed_dualgreedy" not in (left, right)}
             pairs.append(pair)
             for stratum in _strata(pair):
-                groups[(left, right, *(str(lhs[k]) for k in REPORT_FIELDS), *stratum)].append(pair)
+                fields = dict(zip(BUDGET_FIELDS, _comparison_budget(lhs)))
+                groups[(left, right, *(fields[k] for k in REPORT_FIELDS), *stratum)].append(pair)
     output = []
     for key, values in groups.items():
         base = {"arm": key[0], "control": key[1], **dict(zip(REPORT_FIELDS, key[2:2 + len(REPORT_FIELDS)])),
                 "M": key[-3], "N": key[-2], "alpha": key[-1],
                 "matched_executor": "fixed_dualgreedy" not in key[:2]}
+        # The grouping key uses comparison SHA. Keep both full method identities
+        # alongside it so differing theta intervals never disappear from reports.
+        base["comparison_protocol_sha256"] = base.pop("protocol_sha256")
+        for field in ("protocol_sha256", "control_protocol_sha256", "theta_update", "theta_interval",
+                      "control_theta_update", "control_theta_interval", "matched_update_schedule"):
+            variants = sorted({str(v[field]) for v in values})
+            base[field] = variants[0] if len(variants) == 1 else json.dumps(variants)
         by_seed, by_instance = defaultdict(list), defaultdict(dict)
         for pair in values:
             by_seed[str(pair["seed"])].append(float(pair["gap_delta_pp"]))

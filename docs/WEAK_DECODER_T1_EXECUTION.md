@@ -230,3 +230,9 @@ controller backward 具体归属需要结合 autograd 事件检查；total backw
 
 尚待用户执行：完整A1、正式β校准及选择、B1/B2正式预算、两臂门控训练、全量greedy/sample64、
 曲线与性能剖析。效果假设未验证，后续研究决策仍由Claude按指导矩阵给出。
+
+
+## T1-R 结果与后续 T1-P
+
+2026-11-05：Claude 的结果分析与新任务见 [T1R_RESULTS_AND_T1P_GUIDANCE.md](T1R_RESULTS_AND_T1P_GUIDANCE.md)。
+T1-R 已提交并推送为 `5b390e4`；后续代码交付与用户运行命令见 [WEAK_DECODER_T1P_EXECUTION.md](WEAK_DECODER_T1P_EXECUTION.md)。
