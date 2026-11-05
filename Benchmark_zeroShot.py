@@ -7,6 +7,7 @@ sampleK is exactly K sampled trajectories, excluding the separate greedy rollout
 """
 from __future__ import annotations
 
+import math
 import copy
 import hashlib
 import json
@@ -164,7 +165,7 @@ def _load_arms(cfg, arms, checkpoint, static_checkpoint, device):
                     raise ValueError(f"Static/dynamic training budgets differ: {key}")
         reference_cfg, training_seed = mc, ck_seed
         models[name], configs[name] = model, mc
-        checkpoints[name] = {"path": path, "sha256": sha256_file(path), "epoch": ck.get("epoch"),
+        checkpoints[name] = {"path": path, "sha256": sha256_file(path), "epoch": ck.get("epoch"), "global_step": ck.get("global_step"),
                              "selection_rule": ck.get("selection_rule", "not_recorded"),
                              "config": ck.get("config"), "training_seed": ck_seed}
     for name in arms:
@@ -187,7 +188,7 @@ def protocol_sha256(cfg):
     model = cfg.to_dict()["model"]
     for key in ("theta_update", "untrained_random_heads"):
         model.pop(key, None)
-    protocol = {"formula": "weak_decoder_t1_g0g1_v1", "model": model, "env": cfg.to_dict()["env"],
+    protocol = {"formula": "weak_decoder_t1r_zscore_v1" if cfg.model.score_normalization else "weak_decoder_t1_g0g1_v1", "model": model, "env": cfg.to_dict()["env"],
                 "sampling": "exact-K-excluding-greedy", "search": "top-pool-retaining-duplicates",
                 "global_temperature": "initial-for-controls-fitted-for-learned"}
     return hashlib.sha256(json.dumps(protocol, sort_keys=True).encode()).hexdigest()
@@ -197,6 +198,7 @@ def main(argv=None):
     parser = build_arg_parser("Matched zero-shot weak-decoder evaluation.")
     parser.add_argument("--checkpoint", "--dynamic_checkpoint", dest="checkpoint", default=None)
     parser.add_argument("--static_checkpoint", default=None)
+    parser.add_argument("--beta", type=float, default=None, help="shared inverse temperature for ALL arms; requires normalized scores")
     parser.add_argument("--arm", default="learned_dynamic", help="comma-separated subset of " + ",".join(ARMS))
     parser.add_argument("--stages", default="greedy")
     parser.add_argument("--baseline_only", action="store_true", help="alias for --arm fixed_dualgreedy")
@@ -219,6 +221,17 @@ def main(argv=None):
         raise ValueError("temperature must be positive and search budgets nonnegative")
     device = get_device(cfg)
     models, configs, checkpoints, training_seed = _load_arms(cfg, arms, args.checkpoint, args.static_checkpoint, device)
+    if args.beta is not None:
+        if not math.isfinite(args.beta) or args.beta <= 0 or ec.sample_temperature != 1.0:
+            raise ValueError("Shared beta requires finite positive beta and sample_temperature=1")
+        for a in arms:
+            if not configs[a].model.score_normalization:
+                raise ValueError("Shared T1-R beta requires normalized checkpoints")
+            configs[a].model.temperature_mode = "fixed"
+            configs[a].model.temperature_init = 1.0 / args.beta
+            if models[a] is not None:
+                with torch.no_grad():
+                    models[a].log_temperature.fill_(math.log(1.0/args.beta))
     envs = {a: MKPEnv(configs[a].env) for a in arms}
     if any(configs[a].env.feasibility_mode != "hard_mask" for a in arms):
         raise ValueError("Main arms require hard_mask; rejection-mode results need a named ablation")
@@ -248,7 +261,8 @@ def main(argv=None):
                         "Stage RNG resets by evaluation seed, instance ID and stage, independently of arm.",
             "historical_reference": "fixed_dualgreedy uses static capacities/root dual. Its sampling extension "
                                     "softmaxes log ratio; this arm is not a matched-executor control.",
-            "temperature_control": "fixed/untrained use the configured initial global T; learned arms use "
+            "shared_beta_override": args.beta,
+            "temperature_control": "Fixed-mode normalized checkpoints share configured beta; --beta overrides every arm. Learned-mode comparisons: fixed/untrained use the configured initial global T; learned arms use "
                                    "their fitted global T. Greedy is invariant to T. Sampling comparisons "
                                    "therefore include the effect of learning a global temperature.",
             "evidence": "One training seed per invocation. Combine >=3 independent training seeds with "

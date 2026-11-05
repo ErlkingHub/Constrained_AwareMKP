@@ -1,5 +1,9 @@
 # Constrained_AwareMKP
 
+> 2026-11-04: T1-R is implemented. Follow [the T1-R run instructions](docs/WEAK_DECODER_T1_EXECUTION.md#t1-r). Older sections describe the T1 baseline. Old checkpoints retain raw scores; new configs use normalized scores and fixed temperature. Calibrate beta before experiments.
+
+> 2026-11-04: T1-R implementation is now available. Follow [the T1-R run instructions](docs/WEAK_DECODER_T1_EXECUTION.md#t1-r) for full regression, synthetic beta calibration, diagnostics and gated training. Older sections below describe the T1 baseline; old checkpoints retain raw scores. New configs default to normalized scores and fixed temperature; the experimental beta must be calibrated first.
+
 State-conditioned resource control for multidimensional 0-1 knapsack problems.
 The current implementation is **T1 (G0 + G1)** of
 [`docs/CODE_GUIDANCE_WEAK_DECODER_MIGRATION.md`](docs/CODE_GUIDANCE_WEAK_DECODER_MIGRATION.md).

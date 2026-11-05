@@ -214,18 +214,36 @@ class WeakDecoder:
     """Pure transparent T1 scorer; owns no trainable parameters or item embeddings."""
 
     def __init__(self, model_cfg, env_cfg):
+        self.normalize = model_cfg.score_normalization
         self.price_floor = model_cfg.price_floor
         self.mode = getattr(env_cfg, "feasibility_mode", "hard_mask")
         self.beta = getattr(env_cfg, "soft_mask_beta", 5.0)
         if self.mode not in ("hard_mask", "perceive", "soft_mask"):
             raise ValueError(f"Unknown feasibility mode: {self.mode}")
 
-    def __call__(self, st: MKPState, theta: Dict[str, torch.Tensor]):
+    @staticmethod
+    def moments(score, fits):
+        count = fits.sum(1, keepdim=True).clamp_min(1)
+        masked = score.masked_fill(~fits, 0.0)
+        mean = masked.sum(1, keepdim=True) / count
+        centered = (score - mean).masked_fill(~fits, 0.0)
+        # Vector norm has a defined zero gradient at zero (unlike sqrt(var)).
+        std = torch.linalg.vector_norm(centered, dim=1, keepdim=True) / count.sqrt()
+        return mean, std
+
+    def raw_scores(self, st: MKPState, theta: Dict[str, torch.Tensor]):
         base = st.mu + self.price_floor * st.mu.mean(1, keepdim=True) + 1e-6
         lam = base * theta["u"].exp()
         cost = torch.einsum("bm,bmn->bn", lam, st.inst.r / (st.c_rem[:, :, None] + 1.0))
         p_norm = st.inst.p / st.inst.p.mean(1, keepdim=True).clamp_min(_EPS)
         score = theta["alpha"][:, None] * p_norm.clamp_min(_EPS).log() - cost.clamp_min(1e-9).log()
+        return score, lam
+
+    def __call__(self, st: MKPState, theta: Dict[str, torch.Tensor]):
+        score, lam = self.raw_scores(st, theta)
+        if self.normalize:
+            mean, std = self.moments(score.float(), st.fits)
+            score = (score.float() - mean) / (std + 1e-6)
         if self.mode == "soft_mask":
             over = (st.inst.r - st.c_rem[:, :, None]).clamp_min(0) / (st.inst.r + 1.0)
             viol = over.max(1).values
@@ -268,8 +286,9 @@ class ConstrainedMKPPolicy(nn.Module):
         return {"u": torch.zeros_like(st.mu), "alpha": torch.ones_like(st.profit)}
 
     def _step_core(self, x_s, y_s, edge_s, item_d, res_d, edge_d, glob, avail):
-        x, y, g = self.encoder.fuse_dynamic(x_s, y_s, item_d, res_d, glob)
-        theta = self.controller(x, y, g, torch.cat([edge_s, edge_d], dim=-1), avail)
+        with torch.profiler.record_function("t1r/controller_forward"):
+            x, y, g = self.encoder.fuse_dynamic(x_s, y_s, item_d, res_d, glob)
+            theta = self.controller(x, y, g, torch.cat([edge_s, edge_d], dim=-1), avail)
         return theta["u"], theta["alpha"]
 
     def forward(self, env: MKPEnv, inst: MKPInstances, num_samples: int = 1,
@@ -330,7 +349,7 @@ class ConstrainedMKPPolicy(nn.Module):
                 raise ValueError("theta_override must be 'fixed' or a u/alpha dict")
         logp_sum = torch.zeros(inst.B, device=dev)
         ent_sum, n_dec = torch.zeros_like(logp_sum), torch.zeros_like(logp_sum)
-        stats = {"u_abs_mean": 0.0, "alpha_mean": 0.0}
+        stats = {k: 0.0 for k in ("u_abs_mean", "alpha_mean", "alpha_lower_frac", "alpha_upper_frac", "u_boundary_frac", "raw_score_std")}
         n_stat = 0
         trace = [] if return_trace else None
         use_ckpt = self.training and self.mcfg.grad_checkpoint and torch.is_grad_enabled()
@@ -350,7 +369,8 @@ class ConstrainedMKPPolicy(nn.Module):
                     theta_static = theta
             else:
                 theta = theta_static
-            logits, lam = self.decoder(st, theta)
+            with torch.profiler.record_function("t1r/executor"):
+                logits, lam = self.decoder(st, theta)
             valid = st.fits if self.decoder.mode == "hard_mask" else st.available
             if not bool(torch.isfinite(logits[valid]).all()):
                 raise FloatingPointError("Non-finite scores on candidate items")
@@ -371,6 +391,12 @@ class ConstrainedMKPPolicy(nn.Module):
                 n_act = active.sum().clamp_min(1.0)
                 stats["u_abs_mean"] += (theta["u"].abs().mean(1) * active).sum() / n_act
                 stats["alpha_mean"] += (theta["alpha"] * active).sum() / n_act
+                stats["alpha_lower_frac"] += ((theta["alpha"] < .52) * active).sum() / n_act
+                stats["alpha_upper_frac"] += ((theta["alpha"] > 2.48) * active).sum() / n_act
+                stats["u_boundary_frac"] += ((theta["u"].abs() > .95*self.mcfg.u_max).float().mean(1)*active).sum()/n_act
+                raw, _ = self.decoder.raw_scores(st, theta)
+                _, raw_std = self.decoder.moments(raw, st.fits)
+                stats["raw_score_std"] += (raw_std.squeeze(1)*active).sum()/n_act
                 n_stat += 1
                 if return_trace:
                     trace.append({"action": action.detach().cpu(), "active": active.bool().cpu(),
@@ -378,7 +404,8 @@ class ConstrainedMKPPolicy(nn.Module):
                                   "temperature": global_T.detach().expand(inst.B).cpu(),
                                   "lambda": lam.detach().cpu(),
                                   "fits_before": st.fits.gather(1, action[:, None]).squeeze(1).cpu()})
-            st = env.step(st, action)
+            with torch.profiler.record_function("t1r/environment"):
+                st = env.step(st, action)
         out = {"reward": env.get_reward(st), "profit": st.profit, "n_reject": st.n_reject,
                "log_likelihood": logp_sum, "entropy": ent_sum / n_dec.clamp_min(1),
                "solution": st.solution, "ub": st.ub, "steps": st.t,
@@ -386,6 +413,7 @@ class ConstrainedMKPPolicy(nn.Module):
                "alpha_mean": float(stats["alpha_mean"] / max(n_stat, 1)),
                "temperature": float(global_T.detach()),
                "theta_dim": inst.M + int("alpha" in self.mcfg.theta_groups)}
+        out.update({k: float(v / max(n_stat, 1)) for k, v in stats.items()})
         if return_trace:
             out["trace"] = trace
         return out

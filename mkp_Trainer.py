@@ -41,7 +41,8 @@ CHECKPOINT_SCHEMA = "weak_decoder_t1_v1"
 
 def _check_checkpoint(ck, expected_model=None):
     """Reject legacy item-residual models instead of silently discarding config fields."""
-    model_cfg = ck.get("config", {}).get("model", {})
+    model_cfg = dict(ck.get("config", {}).get("model", {}))
+    model_cfg.setdefault("score_normalization", False)
     legacy = {"residual_max", "primitives", "init_primitive", "init_primitive_logit",
               "kappa_init", "kappa_min", "price_log_range"}.intersection(model_cfg)
     legacy_weights = any(any(part in key for part in ("res_head", "prim_head", "kappa_head"))
@@ -117,6 +118,7 @@ class MKPTrainer:
         self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, self._lr_lambda)
         self.epoch, self.global_step, self.best_val = 0, 0, float("inf")
         self.inherited_best, self.best_checkpoint_path = None, None
+        self.initial_gap, self.gate_gaps = None, []
         self.amp = cfg.device.amp and device.type == "cuda"
 
         self.train_csv = _CSVLogger(os.path.join(self.run_dir, "train_log.csv"))
@@ -208,6 +210,7 @@ class MKPTrainer:
                 "selection_rule": self.selection_rule, "source": self.source,
                 "validation_manifest": self.validation_manifest,
                 "inherited_best": self.inherited_best,
+                "initial_gap": self.initial_gap, "gate_gaps": self.gate_gaps,
                 "rng": {"python": random.getstate(), "numpy": np.random.get_state(),
                         "torch": torch.get_rng_state(),
                         "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None}}
@@ -287,6 +290,7 @@ class MKPTrainer:
             self.epoch = ck.get("epoch", 0)
             self.global_step = ck.get("global_step", 0)
             self.best_val = ck.get("best_val", float("inf"))
+            self.initial_gap, self.gate_gaps = ck.get("initial_gap"), ck.get("gate_gaps", [])
             self._inherit_best(ck, path)
             rng = ck.get("rng")
             if rng:
@@ -312,7 +316,8 @@ class MKPTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         per_chunk = max(1, tc.max_rollouts_per_chunk // K)
         agg = {"loss": 0.0, "reward": 0.0, "best_reward": 0.0, "gap_ub": 0.0, "reject_rate": 0.0,
-               "entropy": 0.0, "u_abs_mean": 0.0, "alpha_mean": 0.0, "temperature": 0.0}
+               "entropy": 0.0, "u_abs_mean": 0.0, "alpha_mean": 0.0, "temperature": 0.0,
+               "alpha_lower_frac": 0.0, "alpha_upper_frac": 0.0, "u_boundary_frac": 0.0, "raw_score_std": 0.0}
         for s in range(0, B, per_chunk):
             e = min(B, s + per_chunk)
             sub = MKPInstances(inst.p[s:e], inst.r[s:e], inst.c[s:e])
@@ -337,7 +342,7 @@ class MKPTrainer:
                 agg["gap_ub"] += ((1 - profit.max(1).values / ubv[:, 0]) * 100).mean().item() * frac
                 agg["reject_rate"] += (out["n_reject"] / max(out["steps"], 1)).mean().item() * frac
                 agg["entropy"] += out["entropy"].mean().item() * frac
-                for key in ("u_abs_mean", "alpha_mean", "temperature"):
+                for key in ("u_abs_mean", "alpha_mean", "temperature", "alpha_lower_frac", "alpha_upper_frac", "u_boundary_frac", "raw_score_std"):
                     agg[key] += float(out[key]) * frac
         gn = torch.nn.utils.clip_grad_norm_(self.model.parameters(), tc.grad_clip)
         finite_gradients = bool(torch.isfinite(gn))
@@ -369,6 +374,14 @@ class MKPTrainer:
 
     def fit(self):
         tc = self.cfg.train
+        if tc.gate_early_stop and (tc.val_every != 1 or self.cfg.model.theta_update != "step"):
+            raise ValueError("Gate early stopping requires dynamic theta and validation every epoch")
+        if not tc.resume and tc.initial_validation:
+            val = self.validate()
+            self.initial_gap = self.best_val = val["gap_mean"]
+            self.val_csv.log({"epoch": -1, "step": 0, **val, "best": self.best_val})
+            self.log(f"epoch -1 initialization validation: {val}")
+            self.save(True)
         start_epoch = self.epoch
         for ep in range(start_epoch, tc.epochs):
             self.epoch = ep
@@ -390,6 +403,8 @@ class MKPTrainer:
                            f"| loss {st['loss']:+.4f} | R {st['reward']:.4f} | gapUB(best of K) "
                            f"{st['gap_ub']:.3f}% | rej {st['reject_rate']:.3f} | H {st['entropy']:.3f} "
                            f"| |u| {st['u_abs_mean']:.3f} | alpha {st['alpha_mean']:.3f} "
+                           f"| alpha_lo/hi {st['alpha_lower_frac']:.3f}/{st['alpha_upper_frac']:.3f} "
+                           f"| u_boundary {st['u_boundary_frac']:.3f} | raw_std {st['raw_score_std']:.5f} "
                            f"| T {st['temperature']:.3f} | grad {st['grad_norm']:.3f} "
                            f"| lr {st['lr']:.2e} | {time.time() - t0:.0f}s")
                     self.log(msg)
@@ -407,7 +422,13 @@ class MKPTrainer:
                          ", ".join(f"{k}={x:.4f}" for k, x in val.items()) +
                          f" | best {self.best_val:.4f}{' *' if is_best else ''} | epoch time {time.time() - t0:.0f}s")
             self.epoch = ep + 1
+            if ep < 4 and tc.gate_early_stop:
+                self.gate_gaps.append(val["gap_mean"])
             self.save(is_best)
+            if tc.gate_early_stop and ep == 3 and self.initial_gap is not None and len(self.gate_gaps) == 4 and all(g > self.initial_gap + tc.gate_margin_pp for g in self.gate_gaps):
+                write_json(os.path.join(self.run_dir, "early_stop.json"), {"reason": "epochs 0-3 all worse than initialization", "initial_gap": self.initial_gap, "gaps": self.gate_gaps, "margin_pp": tc.gate_margin_pp})
+                self.log("T1-R gate early stop triggered; inspect boundary fractions and raw_score_std in train_log.csv")
+                break
         if self.tb is not None:
             self.tb.close()
         best_description = (self.best_checkpoint_path if self.best_checkpoint_path is not None else

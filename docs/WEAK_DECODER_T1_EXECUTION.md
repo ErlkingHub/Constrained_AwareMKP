@@ -136,3 +136,97 @@ learned 使用训练后的全局 T，因此 sampling 增量包含全局温度学
 
 当前未验证：T0 全量贡献拆解、T1 三种子显著性与跨规模学习收益、单轨迹 greedy <=0.1%。
 G2/G3 的 blocked_mass/残余 LP 正确性与成本检查属于后续阶段，当前没有冒充完成。
+
+
+## T0 全量与 T1 seed1234 结果
+
+2026-11-04 更新。分析与研究决策来自 Claude 的
+[T0_T1_ANALYSIS_AND_T1R_GUIDANCE.md](T0_T1_ANALYSIS_AND_T1R_GUIDANCE.md)，本次不重新跑全量结果。
+本文此前“未运行 T0/正式 T1”是 11-02 交付时的历史状态，现由后续运行更新：
+
+- T0 全量：`results/legacy_t0/20261102_141830_091197/`，180 实例；a/b/c/c_fullfixed 的
+  greedy 约为 0.437/0.450/0.583/0.583%，sample256+ILS 为 0.065/0.064/0.064/0.116%。
+  具体统计与解释以 Claude 指导为准。
+- T1：`results/20261103_130436_240755/`；fixed/untrained/static/dynamic 的 greedy 约为
+  0.611/1.233/2.153/1.958%。dynamic 只训练至 ep10 it201，static 为 40 epoch，不能判断动态与静态优劣。
+- `results/paired_3seeds/meta.json` 已补 `training_seeds:[1234]` 和 `single seed; name is legacy`，保留原路径。
+- 本次没有从日志时序推断历史 dynamic 的停止原因，也无法据此确认历史 GPU 共享情况。
+
+## T1-R
+
+实施日期：2026-11-04。按用户分工，Codex 修改实现并做小规模验证；Claude 分析与指导；全量训练与评估由用户运行。
+
+### 版本与改动
+
+实施前已保存当前 T1 实现：分支 `codex/t1-baseline-before-t1r`，提交 **`4d5e686`**。
+这是本次开始时源码的快照，不冒称为历史训练时已记录的 commit。
+当前实施分支 `codex/t1r-sharpness-decoupling`，T1-R 改动尚未提交；实验 meta 会保存 commit/diff。
+
+- 新配置默认 `score_normalization=true, temperature_mode=fixed`。原始分数在可行集上做 float32、
+  总体标准差 z-score，不截断，std 梯度保留；零方差、单候选与 done 行处理保持有限。
+- 旧 checkpoint 没有新配置字段时显式使用 raw scores，支持前后回归；新固定温度的默认数值只是占位，实验必须用校准 β0。
+- 增加 alpha 上/下界比例、u 触界比例、原始可行分数 std；epoch −1 验证参与 best 选择。
+  dynamic 在 epoch 0–3 全部比初始化差 >0.3 pp 时保存 early_stop.json 并停止。
+- 评测 `--beta` 对全部臂统一逆温度，要求 normalized checkpoints 且 sample_temperature=1。
+  标准化和温度配置纳入协议 SHA，旧 T1 与 T1-R 不能混配；记录所选 checkpoint 的 global_step。
+- 新增合成 β 校准、常数 alpha 扫描、逐实例静态 theta 搜索（256 随机包含 fixed + 256 坐标搜索）、
+  greedy 回归、配置准备/训练入口、曲线导出、性能 trace 脚本。搜索结果仅作可达余量下界诊断。
+- REINFORCE、同实例 K16 基线、lr、entropy、theta 范围保持原设计；不加入 G2/G3 或数学上的工程加速。
+
+### 已验证内容
+
+原有 31 项测试及新增 6 项 T1-R 测试全部通过（先整套 36 项通过，随后新增配置准备保护测试通过）。
+Python 编译与 `git diff --check` 通过。
+
+小规模脚本产物在 `results/t1r_code_checks/`：
+
+- `beta/`：N8/M2 一个合成实例，校准 CSV/meta 写入通过，标记 smoke_only，不能用于正式 β0。
+- `headroom/`：同一实例，随机4+坐标4次评估，alpha 扫描、可行极大解审计与见证写入通过。
+- `regression/`：仅 Chu 第1个实例，fixed/旧 dynamic/旧 static 的目标分别为 24003/23314/23789，
+  标准化前后均一致；不替代 180 实例验收。
+- 门控早停使用可控验证值做单元测试，梯度另用真实小实例验证；没有启动全量训练。
+- 配置准备脚本默认只写配置，不训练；拒绝 smoke 校准和不完整或有差异的 greedy 回归。
+
+### 用户运行顺序
+
+从仓库根目录运行，python 指安装 PyTorch 的环境。已有结果目录会拒绝覆盖，可用 --output 改名。
+
+```powershell
+# A1：完整180实例，fixed及两个旧checkpoint的前后greedy回归
+python scripts/t1r_regression.py --device cuda:0
+
+# A3：仅128个固定合成验证实例、MILP参考，选择beta0
+python scripts/calibrate_beta.py --device cuda:0
+
+# B1/B2：主合成诊断，默认256+256；次要Chu诊断单独保存，不能参与选择
+python scripts/theta_headroom.py --device cuda:0
+python scripts/theta_headroom.py --dataset chu --device cuda:0 --output results/t1r_headroom_chu
+
+# 只准备配置供检查；通过完整回归和校准后再由用户启动两臂训练
+python scripts/run_t1r.py
+python scripts/run_t1r.py --mode step --train
+python scripts/run_t1r.py --mode static --train
+
+# 从两份新checkpoint继承相同固定beta，主greedy和sample64，不跑ILS
+python Benchmark_zeroShot.py --arm fixed,untrained,learned_static,learned_dynamic --dynamic_checkpoint checkpoints/t1r_dynamic_s1234/best.pt --static_checkpoint checkpoints/t1r_static_s1234/best.pt --stages greedy,sample64 --eval.sample_temperature 1
+
+# 曲线导出需要matplotlib（缺少时在自己的环境安装）；性能脚本不更新权重
+python scripts/plot_t1r.py
+python scripts/profile_t1r.py --config results/t1r_configs/step.json --device cuda:0
+```
+
+`run_t1r.py` 从 `runs/dynamic_s1234/config.json` 继承设置，仅按指导改变归一化、固定温度、
+10 epoch、theta_update、运行名、初始化验证和 dynamic 门控；不加载旧权重。
+配置写入 `results/t1r_configs/`，校准与回归 meta 的 SHA 一并保存。
+原运行已存在时拒绝覆盖；准备好的相同配置可以在后续 --train 时复用。
+两臂计划预算一致；若 dynamic 早停，实际预算不同，回报时须明确，不能声称已作匹配预算的 Q-1 结论。
+
+全量 greedy 回归中，任一臂差异超过2个实例会立即停止。
+任何差异都会阻止自动训练前置检查，应把逐实例结果交给 Claude 检查浮点并列原因。
+
+性能工具导出 Chrome trace 与算子表，标记 LP、controller forward、executor、environment、total backward。
+controller backward 具体归属需要结合 autograd 事件检查；total backward 还包含 encoder/score。
+本次没有实测或解释历史16–18倍耗时差、停止原因和历史GPU共享，也未实施需要逐步log-prob一致性证明的加速。
+
+尚待用户执行：完整A1、正式β校准及选择、B1/B2正式预算、两臂门控训练、全量greedy/sample64、
+曲线与性能剖析。效果假设未验证，后续研究决策仍由Claude按指导矩阵给出。

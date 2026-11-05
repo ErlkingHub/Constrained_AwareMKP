@@ -97,7 +97,8 @@ class ModelConfig:
     price_anchor: str = "root"
     u_max: float = 3.0                   # tanh bound before centering (sum_j u_j = 0)
     theta_update: str = "step"           # step | static (static must be trained separately)
-    temperature_mode: str = "learned"    # one global scalar, independent of state and N
+    score_normalization: bool = True    # T1-R feasible-set z-score; old checkpoints retain False
+    temperature_mode: str = "fixed"    # one global scalar, independent of state and N
     temperature_init: float = 1.0 / 3.0
     untrained_random_heads: bool = False # True only for the untrained control arm
     price_floor: float = 0.05             # floor (relative to mean dual price) for non-binding dims
@@ -109,6 +110,9 @@ class ModelConfig:
 # --------------------------------------------------------------------------------------
 @dataclass
 class TrainConfig:
+    initial_validation: bool = True
+    gate_early_stop: bool = False
+    gate_margin_pp: float = 0.3
     epochs: int = 100
     steps_per_epoch: int = 250
     batch_size: int = 64                  # instances per step
@@ -221,6 +225,8 @@ def config_from_dict(d: dict) -> Config:
         for k, v in values.items():
             if k in valid:
                 setattr(sub, k, v)
+    if d and "model" in d and "score_normalization" not in d["model"]:
+        cfg.model.score_normalization = False
     return cfg
 
 

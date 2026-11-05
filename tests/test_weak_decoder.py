@@ -89,6 +89,7 @@ class WeakDecoderContractTests(unittest.TestCase):
         st.status[:, 3] = 1
         self.env._refresh(st)
         theta = {"u": torch.tensor([[0.2, -0.2]]), "alpha": torch.tensor([1.4])}
+        self.cfg.model.score_normalization = False
         decoder = WeakDecoder(self.cfg.model, self.cfg.env)
         scores, lam = decoder(st, theta)
         expected_lam = (st.mu + self.cfg.model.price_floor * st.mu.mean(1, keepdim=True)

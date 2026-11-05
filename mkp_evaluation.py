@@ -165,6 +165,8 @@ def main(argv=None):
     write_csv(dest / "paired_summary.csv", summary)
     write_csv(dest / "summary.csv", summarize(rows))
     (dest / "meta.json").write_text(json.dumps({"inputs": args.inputs,
+        "training_seeds": sorted({int(r["seed"]) for r in rows}),
+        "note": "single seed" if len({r["seed"] for r in rows}) == 1 else "multiple training seeds",
         "gap_units": "percentage points; arm minus control, negative is better",
         "seed_aggregation": "instance differences averaged across all matched training seeds",
         "p_values": "two-sided Wilcoxon, unadjusted; report comparison and seed counts"}, indent=2), encoding="utf-8")
