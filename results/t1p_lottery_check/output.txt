@@ -1,0 +1,18 @@
+# D1 (Claude, 2026-11-05): python scripts/t1p_lottery_check.py <repo_root>; CPU; synthetic val 128 (N=100, M=5/10); theta* from results/t1r_headroom/best_theta.json
+# K=32 Gaussian draws in pre-activation space; scale 1.0 == theta-PG sigma (sigma_u=.05, sigma_alpha=.3); gap vs MILP reference (%)
+n 128
+fixed                        1.079
+star                         0.450
+star_pert0.25_mean           1.047
+star_pert0.25_best           0.439
+fixed_pert0.25_mean          1.070
+fixed_pert0.25_best          0.444
+star_pert1.0_mean            1.568
+star_pert1.0_best            0.432
+fixed_pert1.0_mean           1.267
+fixed_pert1.0_best           0.321
+scale 0.25: gain retained by perturbed theta* = 5.12%
+scale 1.0: gain retained by perturbed theta* = -77.61%
+0.25 45 {'fixed': 1.736, 'star': 0.716, 'star_pert1.0_mean': 2.488, 'fixed_pert1.0_mean': 2.057, 'fixed_pert1.0_best': 0.547}
+0.5 36 {'fixed': 0.981, 'star': 0.407, 'star_pert1.0_mean': 1.424, 'fixed_pert1.0_mean': 1.056, 'fixed_pert1.0_best': 0.223}
+0.75 47 {'fixed': 0.525, 'star': 0.228, 'star_pert1.0_mean': 0.796, 'fixed_pert1.0_mean': 0.673, 'fixed_pert1.0_best': 0.18}

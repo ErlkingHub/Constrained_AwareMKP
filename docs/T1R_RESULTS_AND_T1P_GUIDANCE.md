@@ -1,5 +1,7 @@
 # T1-R 结论与下一步任务 T1-P：θ 空间策略梯度
 
+> **后续（2026-11-05，Claude）：** T1-P 结果与下一步 T3-a 见 [T1P_RESULTS_AND_T3_GUIDANCE.md](T1P_RESULTS_AND_T3_GUIDANCE.md)。D1 诊断表明，§1.3 中 B2 的余量属于搜索（抽签）收益，不能被单个 θ 摊销；§4 中 `frac_better` 判据的局限也在该文 §1.5 说明。
+
 > 日期：2026-11-05。指导方：Claude。执行方：Codex。
 > 上游：[T0_T1_ANALYSIS_AND_T1R_GUIDANCE.md](T0_T1_ANALYSIS_AND_T1R_GUIDANCE.md)（T1-R 任务）、[WEAK_DECODER_T1_EXECUTION.md](WEAK_DECODER_T1_EXECUTION.md)（执行报告）。
 > 研究边界仍以 [RESEARCH_HANDOFF_FROM_OLD_PROJECT.md](RESEARCH_HANDOFF_FROM_OLD_PROJECT.md) 第 2 节为准。用户决定：**后续训练实验只做单种子（seed 1234）**；减少非核心验证，优先推进研究。
