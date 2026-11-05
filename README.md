@@ -1,5 +1,7 @@
 # Constrained_AwareMKP
 
+> 2026-11-05 T3: [Residual-LP basis scan and gated training handoff](docs/WEAK_DECODER_T3_EXECUTION.md). T3-a scans fixed greedy executors; T3-b is prepared for user-run training only after the research gate. Default G0/G1 behavior is retained.
+
 > 2026-11-05: [T1-P theta-space policy-gradient implementation and user run commands](docs/WEAK_DECODER_T1P_EXECUTION.md) are available. The default signal for new runs is theta_pg; older configs retain item_pg. T2 blocking is implemented as an opt-in group and is disabled in both T1-P runs.
 
 > 2026-11-04: T1-R is implemented. Follow [the T1-R run instructions](docs/WEAK_DECODER_T1_EXECUTION.md#t1-r). Older sections describe the T1 baseline. Old checkpoints retain raw scores; new configs use normalized scores and fixed temperature. Calibrate beta before experiments.

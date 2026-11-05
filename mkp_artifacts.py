@@ -38,6 +38,10 @@ def source_provenance():
     untracked = git("ls-files", "--others", "--exclude-standard")
     files, contents = {}, {}
     for name in (untracked or "").splitlines():
+        # Generated runs can be intentionally unignored by the user. They already
+        # have separate manifests; embedding them recursively bloats source snapshots.
+        if name.replace("\\", "/").split("/")[0] in ("runs", "results", "cache", "checkpoints"):
+            continue
         path = os.path.join(PROJECT_ROOT, name)
         if os.path.isfile(path):
             files[name] = sha256_file(path)

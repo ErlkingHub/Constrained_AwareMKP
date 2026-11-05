@@ -103,7 +103,10 @@ def instances_from_dicts(insts: List[dict], device="cpu") -> MKPInstances:
 # ======================================================================================
 @torch.no_grad()
 def lp_dual(p: torch.Tensor, r: torch.Tensor, c: torch.Tensor,
-            iters: int = 300, lr: float = 0.05):
+            iters: int = 300, lr: float = 0.05,
+            mu_init: Optional[torch.Tensor] = None,
+            item_mask: Optional[torch.Tensor] = None,
+            scale: Optional[torch.Tensor] = None):
     """Approximately solve the LP-relaxation dual of the MKP
 
         UB = min_{mu >= 0}  sum_i mu_i + sum_j max(0, v_j - a_j^T mu)
@@ -112,6 +115,10 @@ def lp_dual(p: torch.Tensor, r: torch.Tensor, c: torch.Tensor,
     projected Adam on all instances in parallel. Any mu >= 0 gives a valid upper bound,
     so the returned bound is always valid (only possibly slightly loose).
 
+    Optional mu_init carries a nonnegative warm start. item_mask restricts the LP
+    to included items, and scale fixes the whole-instance profit normalization for
+    residual solves. With all three omitted, the original arithmetic is unchanged.
+
     Returns
         mu   (B, M) dual prices per unit of *capacity fraction* (normalised space)
         ub   (B,)   valid LP upper bound in raw profit units
@@ -119,12 +126,34 @@ def lp_dual(p: torch.Tensor, r: torch.Tensor, c: torch.Tensor,
     Chu & Beasley (1998) for pseudo-utility ratios u_j = p_j / sum_i mu_i r_ij / c_i.
     """
     p = p.float(); r = r.float(); c = c.float()
-    scale = p.mean(1, keepdim=True)                       # (B,1)
+    legacy = mu_init is None and item_mask is None and scale is None
+    scale = p.mean(1, keepdim=True) if scale is None else torch.as_tensor(scale, device=p.device).float()
+    if scale.ndim == 1:
+        scale = scale[:, None]
+    if scale.shape != (p.shape[0], 1) or not bool(torch.isfinite(scale).all()) or bool((scale <= 0).any()):
+        raise ValueError("LP profit scale must be positive and finite with shape (B,1)")
     v = p / scale                                         # (B,N)
     a = r / c.clamp_min(_EPS)[:, :, None]                 # (B,M,N)
     B, M, N = a.shape
     # init: price every resource so that an average item costs about its value
-    mu = (v.mean(1, keepdim=True) / (M * a.mean(2).clamp_min(_EPS))).clamp_min(_EPS)
+    if item_mask is not None:
+        item_mask = torch.as_tensor(item_mask, dtype=torch.bool, device=p.device)
+        if item_mask.shape != p.shape:
+            raise ValueError("LP item_mask must have shape (B,N)")
+    if mu_init is not None:
+        mu = torch.as_tensor(mu_init, device=p.device).float().clone()
+        if mu.shape != (B, M) or not bool(torch.isfinite(mu).all()) or bool((mu < 0).any()):
+            raise ValueError("LP mu_init must be finite and nonnegative with shape (B,M)")
+    elif item_mask is not None:
+        weight = item_mask.float()
+        count = weight.sum(1, keepdim=True).clamp_min(1)
+        avg_value = (v * weight).sum(1, keepdim=True) / count
+        avg_load = (a * weight[:, None, :]).sum(2) / count
+        mu = (avg_value / (M * avg_load.clamp_min(_EPS))).clamp_min(_EPS)
+    else:
+        mu = (v.mean(1, keepdim=True) / (M * a.mean(2).clamp_min(_EPS))).clamp_min(_EPS)
+    if item_mask is not None:
+        mu = torch.where(item_mask.any(1, keepdim=True), mu, torch.zeros_like(mu))
     m1 = torch.zeros_like(mu); m2 = torch.zeros_like(mu)
     b1, b2 = 0.9, 0.999
     best_mu = mu.clone()
@@ -132,12 +161,20 @@ def lp_dual(p: torch.Tensor, r: torch.Tensor, c: torch.Tensor,
 
     def dual_value(m):
         red = v - torch.einsum("bm,bmn->bn", m, a)
+        if item_mask is not None:
+            red = red.masked_fill(~item_mask, -float("inf"))
         return m.sum(1) + red.clamp_min(0).sum(1)
 
+    if not legacy:
+        # Re-evaluate the carried multiplier on THIS residual problem, never reuse
+        # an upper bound computed with previous capacities or a previous item mask.
+        best_val = dual_value(mu)
     for t in range(1, iters + 1):
         frac = t / iters
         tau = 0.05 * (1 - frac) + 1e-3 * frac            # smoothing temperature
         red = v - torch.einsum("bm,bmn->bn", mu, a)       # reduced costs (B,N)
+        if item_mask is not None:
+            red = red.masked_fill(~item_mask, -float("inf"))
         sig = torch.sigmoid(red / tau)
         grad = 1.0 - torch.einsum("bn,bmn->bm", sig, a)
         m1 = b1 * m1 + (1 - b1) * grad
@@ -167,6 +204,12 @@ class MKPState:
     done: torch.Tensor         # (B,) bool
     fits: torch.Tensor         # (B, N) bool: available & fits remaining capacity
     t: int = 0
+    mu_res: Optional[torch.Tensor] = None   # (B,M), normalized to last LP capacities
+    x_lp: Optional[torch.Tensor] = None     # (B,N), fixed-temperature LP primal basis
+    x_lp_root: Optional[torch.Tensor] = None # (B,N), immutable t=0 LP primal basis
+    ub_res: Optional[torch.Tensor] = None   # (B,), residual-only upper bound
+    lp_scale: Optional[torch.Tensor] = None # (B,1), whole-instance mean profit
+    lp_c_rem_prev: Optional[torch.Tensor] = None # (B,M), previous LP capacities
 
     @property
     def available(self) -> torch.Tensor:
@@ -186,6 +229,8 @@ class MKPEnv:
         self.cfg = env_cfg
         self.dual_iters = getattr(env_cfg, "dual_iters", 300)
         self.dual_lr = getattr(env_cfg, "dual_lr", 0.05)
+        self.residual_lp_iters = getattr(env_cfg, "residual_lp_iters", 300)
+        self.residual_lp_lr = getattr(env_cfg, "residual_lp_lr", 0.02)
         self.feasibility_mode = getattr(env_cfg, "feasibility_mode", "hard_mask")
         self.reject_penalty = getattr(env_cfg, "reject_penalty", 0.05)
 
@@ -215,13 +260,46 @@ class MKPEnv:
                       done=torch.zeros(B, dtype=torch.bool, device=dev),
                       fits=torch.zeros(B, N, dtype=torch.bool, device=dev))
         self._refresh(st)
+        st.mu_res = mu.clone()
+        st.ub_res = ub.clone()
+        st.lp_scale = inst.p.mean(1, keepdim=True)
+        st.lp_c_rem_prev = st.c_rem.clamp_min(1.0).clone()
+        root_load = inst.r / inst.c.clamp_min(_EPS)[:, :, None]
+        root_red = inst.p / st.lp_scale - torch.einsum("bm,bmn->bn", mu, root_load)
+        st.x_lp = torch.sigmoid(root_red / 1e-3).masked_fill(~st.fits, 0.0)
+        st.x_lp_root = st.x_lp.clone()
         return st
+
+    @torch.no_grad()
+    def refresh_lp(self, st: MKPState) -> None:
+        """Refresh the residual LP bases without changing the root encoder anchor.
+
+        Prices use capacity-fraction units. Rescale carried prices to the new
+        capacities before solving so their raw-unit prices remain unchanged.
+        The fixed whole-instance profit scale makes prices comparable over time.
+        """
+        capacities = st.c_rem.clamp_min(1.0)
+        previous = st.lp_c_rem_prev if st.lp_c_rem_prev is not None else st.inst.c.clamp_min(1.0)
+        carried = st.mu_res if st.mu_res is not None else st.mu
+        mu_init = carried * capacities / previous.clamp_min(1.0)
+        scale = st.lp_scale if st.lp_scale is not None else st.inst.p.mean(1, keepdim=True)
+        mu_res, ub_res = lp_dual(st.inst.p, st.inst.r, capacities,
+                                 iters=self.residual_lp_iters, lr=self.residual_lp_lr,
+                                 mu_init=mu_init, item_mask=st.fits, scale=scale)
+        red = st.inst.p / scale - torch.einsum("bm,bmn->bn", mu_res,
+                                               st.inst.r / capacities[:, :, None])
+        st.mu_res, st.ub_res = mu_res, ub_res
+        st.x_lp = torch.sigmoid(red / 1e-3).masked_fill(~st.fits, 0.0)
+        st.lp_scale = scale
+        st.lp_c_rem_prev = capacities.clone()
 
     @staticmethod
     def _refresh(st: MKPState) -> None:
         fit_all = (st.inst.r <= st.c_rem[:, :, None] + _EPS).all(1)       # (B,N)
         st.fits = fit_all & st.available
         st.done = ~st.fits.any(1)
+        if st.x_lp is not None:
+            st.x_lp = st.x_lp.masked_fill(~st.fits, 0.0)
 
     @torch.no_grad()
     def step(self, st: MKPState, action: torch.Tensor) -> MKPState:

@@ -8,6 +8,7 @@ Theta-PG samples latent controls at declared decision points and executes greedy
 from __future__ import annotations
 
 import math
+import time
 from contextlib import nullcontext
 from typing import Optional, Dict
 
@@ -155,13 +156,15 @@ class StateEncoder(nn.Module):
 # ======================================================================================
 # High-level strategy controller
 # ======================================================================================
-def theta_from_pre(v, z, u_max, g=None):
+def theta_from_pre(v, z, u_max, g=None, h=None):
     """Transparent activation of resource and scalar latent actions."""
     u = u_max * torch.tanh(v.float())
     theta = {"u": u - u.mean(1, keepdim=True),
              "alpha": 0.5 + 2.0 * torch.sigmoid(z.float())}
     if g is not None:
         theta["gamma"] = F.softplus(g.float())
+    if h is not None:
+        theta["eta"] = F.softplus(h.float())
     return theta
 
 
@@ -205,9 +208,9 @@ class StrategyController(nn.Module):
         groups = list(cfg.theta_groups)
         if len(groups) != len(set(groups)) or "price" not in groups:
             raise ValueError("theta_groups must contain price exactly once")
-        if set(groups) - {"price", "alpha", "block"}:
-            raise ValueError("Supported theta groups are price, alpha, block; LP belongs to T3")
-        self.scalar_names = [name for name in ("alpha", "block") if name in groups]
+        if set(groups) - {"price", "alpha", "block", "lp"}:
+            raise ValueError("Supported theta groups are price, alpha, block, lp")
+        self.scalar_names = [name for name in ("alpha", "block", "lp") if name in groups]
         self.blocks = nn.ModuleList([
             DualAxisBlock(d, cfg.num_heads, cfg.ff_mult, cfg.dropout,
                           F_EDGE_STATIC + F_EDGE_DYN, cfg.edge_hidden)
@@ -227,8 +230,12 @@ class StrategyController(nn.Module):
             nn.init.zeros_(self.scalar_head.weight)
             with torch.no_grad():
                 for index, name in enumerate(self.scalar_names):
-                    self.scalar_head.bias[index] = (math.log(1.0 / 3.0) if name == "alpha" else
-                                                   math.log(math.expm1(self.cfg.block_gamma_init)))
+                    if name == "alpha":
+                        probability = (self.cfg.alpha_init - .5) / 2
+                        self.scalar_head.bias[index] = math.log(probability / (1-probability))
+                    else:
+                        initial = self.cfg.block_gamma_init if name == "block" else self.cfg.lp_eta_init
+                        self.scalar_head.bias[index] = math.log(math.expm1(initial))
 
     def forward(self, x, y, g, edge, avail):
         done = ~avail.any(1)
@@ -246,12 +253,15 @@ class StrategyController(nn.Module):
         v = self.price_head(torch.cat([y, ctx[:, None, :].expand(-1, M, -1)], -1)).squeeze(-1).float()
         scalars = self.scalar_head(ctx).float() if self.scalar_head is not None else None
         z = (scalars[:, self.scalar_names.index("alpha")] if "alpha" in self.scalar_names else
-             torch.full_like(v[:, 0], math.log(1.0 / 3.0)))
+             torch.full_like(v[:, 0], math.log(((cfg.alpha_init-.5)/2)/(1-(cfg.alpha_init-.5)/2))))
         g_pre = scalars[:, self.scalar_names.index("block")] if "block" in self.scalar_names else None
-        theta = theta_from_pre(v, z, cfg.u_max, g_pre)
+        h_pre = scalars[:, self.scalar_names.index("lp")] if "lp" in self.scalar_names else None
+        theta = theta_from_pre(v, z, cfg.u_max, g_pre, h_pre)
         theta.update(u_pre=v, alpha_pre=z)
         if g_pre is not None:
             theta["gamma_pre"] = g_pre
+        if h_pre is not None:
+            theta["eta_pre"] = h_pre
         return theta
 
 
@@ -263,6 +273,9 @@ class WeakDecoder:
 
     def __init__(self, model_cfg, env_cfg):
         self.normalize = model_cfg.score_normalization
+        self.price_anchor = model_cfg.price_anchor
+        self.lp_source = model_cfg.lp_source
+        self.use_lp = "lp" in model_cfg.theta_groups
         self.price_floor = model_cfg.price_floor
         self.use_block = "block" in model_cfg.theta_groups
         self.block_chunk_size = model_cfg.block_chunk_size
@@ -282,7 +295,10 @@ class WeakDecoder:
         return mean, std
 
     def raw_scores(self, st: MKPState, theta: Dict[str, torch.Tensor]):
-        base = st.mu + self.price_floor * st.mu.mean(1, keepdim=True) + 1e-6
+        anchor = st.mu if self.price_anchor == "root" else st.mu_res
+        if anchor is None:
+            raise ValueError("Residual LP anchor is not initialized")
+        base = anchor + self.price_floor * anchor.mean(1, keepdim=True) + 1e-6
         lam = base * theta["u"].exp()
         cost = torch.einsum("bm,bmn->bn", lam, st.inst.r / (st.c_rem[:, :, None] + 1.0))
         p_norm = st.inst.p / st.inst.p.mean(1, keepdim=True).clamp_min(_EPS)
@@ -290,12 +306,17 @@ class WeakDecoder:
         if self.use_block:
             from mkp_basis import blocked_mass
             score = score - theta["gamma"][:, None] * blocked_mass(st, self.block_chunk_size)
+        if self.use_lp:
+            x_lp = st.x_lp_root if self.lp_source == "root" else st.x_lp
+            if x_lp is None:
+                raise ValueError("LP basis is not initialized")
+            score = score + theta["eta"][:, None] * torch.log(x_lp + .01)
         return score, lam
 
-    def __call__(self, st: MKPState, theta: Dict[str, torch.Tensor]):
+    def __call__(self, st: MKPState, theta: Dict[str, torch.Tensor], return_raw_std=False):
         score, lam = self.raw_scores(st, theta)
+        mean, std = self.moments(score.float(), st.fits)
         if self.normalize:
-            mean, std = self.moments(score.float(), st.fits)
             score = (score.float() - mean) / (std + 1e-6)
         if self.mode == "soft_mask":
             over = (st.inst.r - st.c_rem[:, :, None]).clamp_min(0) / (st.inst.r + 1.0)
@@ -304,15 +325,20 @@ class WeakDecoder:
         valid = st.fits if self.mode == "hard_mask" else st.available
         score = score.masked_fill(~valid, NEG)
         # Finished rows are no-ops; avoid a fully masked softmax in a mixed batch.
-        return torch.where(st.done[:, None], torch.zeros_like(score), score), lam
+        logits = torch.where(st.done[:, None], torch.zeros_like(score), score)
+        return (logits, lam, std) if return_raw_std else (logits, lam)
 
 
 class ConstrainedMKPPolicy(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.mcfg, self.ecfg = cfg.model, cfg.env
-        if cfg.model.price_anchor != "root":
-            raise ValueError("T1 supports root price_anchor only; residual LP belongs to T3")
+        if cfg.model.price_anchor not in ("root", "residual") or cfg.model.lp_source not in ("root", "residual"):
+            raise ValueError("price_anchor and lp_source must be root or residual")
+        if isinstance(cfg.model.lp_interval, bool) or not isinstance(cfg.model.lp_interval, int) or cfg.model.lp_interval < 1:
+            raise ValueError("lp_interval must be a positive integer")
+        if not .5 < cfg.model.alpha_init < 2.5 or not math.isfinite(cfg.model.lp_eta_init) or cfg.model.lp_eta_init <= 0:
+            raise ValueError("alpha_init must be strictly inside (.5,2.5) and lp_eta_init positive")
         if cfg.model.theta_update not in ("step", "static"):
             raise ValueError("theta_update must be step or static")
         if cfg.model.temperature_mode not in ("learned", "fixed"):
@@ -328,6 +354,8 @@ class ConstrainedMKPPolicy(nn.Module):
         self.theta_keys = ("u", "alpha", "u_pre", "alpha_pre")
         if "block" in cfg.model.theta_groups:
             self.theta_keys += ("gamma", "gamma_pre")
+        if "lp" in cfg.model.theta_groups:
+            self.theta_keys += ("eta", "eta_pre")
         self.encoder = StateEncoder(cfg.model)
         self.controller = StrategyController(cfg.model)
         self.decoder = WeakDecoder(cfg.model, cfg.env)
@@ -342,9 +370,11 @@ class ConstrainedMKPPolicy(nn.Module):
         return self.log_temperature.exp().clamp_min(1e-6)
 
     def fixed_theta(self, st: MKPState):
-        theta = {"u": torch.zeros_like(st.mu), "alpha": torch.ones_like(st.profit)}
+        theta = {"u": torch.zeros_like(st.mu), "alpha": torch.full_like(st.profit, self.mcfg.alpha_init)}
         if "block" in self.mcfg.theta_groups:
             theta["gamma"] = torch.full_like(st.profit, self.mcfg.block_gamma_init)
+        if "lp" in self.mcfg.theta_groups:
+            theta["eta"] = torch.full_like(st.profit, self.mcfg.lp_eta_init)
         return theta
 
     def _step_core(self, x_s, y_s, edge_s, item_d, res_d, edge_d, glob, avail):
@@ -379,7 +409,17 @@ class ConstrainedMKPPolicy(nn.Module):
         def autocast_context():
             return (torch.autocast("cuda", dtype=torch.bfloat16)
                     if amp and dev.type == "cuda" else nullcontext())
-        mu, ub = pre if pre is not None else env.precompute(inst)
+        def lp_clock():
+            if dev.type == "cuda":
+                torch.cuda.synchronize(dev)
+            return time.perf_counter()
+        root_lp_time_s, lp_time_s, lp_refreshes = 0.0, 0.0, 0
+        if pre is None:
+            started = lp_clock()
+            mu, ub = env.precompute(inst)
+            root_lp_time_s = lp_clock() - started
+        else:
+            mu, ub = pre
         x_s = y_s = edge_s = None
         if theta_override is None:
             item_s, res_s, edge_s = env.static_features(inst, mu, ub)
@@ -424,8 +464,9 @@ class ConstrainedMKPPolicy(nn.Module):
                     raise ValueError("theta_override u exceeds the centered tanh price range")
                 if bool(((theta_static["alpha"] < 0.5) | (theta_static["alpha"] > 2.5)).any()):
                     raise ValueError("theta_override alpha must lie in [0.5,2.5]")
-                if "gamma" in theta_static and (theta_static["gamma"].shape != (inst.B,) or bool((theta_static["gamma"] < 0).any())):
-                    raise ValueError("theta_override gamma must be nonnegative with shape (B,)")
+                for name in ("gamma", "eta"):
+                    if name in theta_static and (theta_static[name].shape != (inst.B,) or bool((theta_static[name] < 0).any())):
+                        raise ValueError(f"theta_override {name} must be nonnegative with shape (B,)")
             else:
                 raise ValueError("theta_override must be 'fixed' or a u/alpha dict")
         logp_sum = torch.zeros(inst.B, device=dev)
@@ -434,6 +475,8 @@ class ConstrainedMKPPolicy(nn.Module):
         stats = {k: 0.0 for k in ("u_abs_mean", "alpha_mean", "alpha_lower_frac", "alpha_upper_frac", "u_boundary_frac", "raw_score_std")}
         if "block" in self.mcfg.theta_groups:
             stats["gamma_mean"] = 0.0
+        if "lp" in self.mcfg.theta_groups:
+            stats["eta_mean"] = 0.0
         n_stat = 0
         trace = [] if return_trace else None
         use_ckpt = self.training and self.mcfg.grad_checkpoint and torch.is_grad_enabled()
@@ -443,7 +486,14 @@ class ConstrainedMKPPolicy(nn.Module):
 
         theta = None
         pre_means = sampled_pre = None
+        residual_needed = (self.mcfg.price_anchor == "residual" or
+                           (self.decoder.use_lp and self.mcfg.lp_source == "residual"))
         while not bool(st.done.all()):
+            if residual_needed and st.t > 0 and st.t % self.mcfg.lp_interval == 0:
+                started = lp_clock()
+                env.refresh_lp(st)
+                lp_time_s += lp_clock() - started
+                lp_refreshes += 1
             decision = (theta_static is None and
                         (theta is None or (self.mcfg.theta_update == "step" and
                                            st.t % self.mcfg.theta_interval == 0)))
@@ -458,20 +508,21 @@ class ConstrainedMKPPolicy(nn.Module):
                                   if use_ckpt else self._step_core(*args))
                     controls = dict(zip(self.theta_keys, values))
                 if theta_noise is not None:
-                    pre_means = {key: controls[key] for key in ("u_pre", "alpha_pre", "gamma_pre")
+                    pre_means = {key: controls[key] for key in ("u_pre", "alpha_pre", "gamma_pre", "eta_pre")
                                  if key in controls}
                     sigmas = {"u_pre": theta_noise.get("sigma_u", .05),
                               "alpha_pre": theta_noise.get("sigma_alpha", .3),
-                              "gamma_pre": theta_noise.get("sigma_gamma", .3)}
+                              "gamma_pre": theta_noise.get("sigma_gamma", .3),
+                              "eta_pre": theta_noise.get("sigma_eta", .3)}
                     sampled_pre, decision_logp = sample_theta_pre(
                         pre_means, sigmas, original_B, K,
                         antithetic=bool(theta_noise.get("antithetic", True)) and st.t == 0,
                         generator=theta_noise.get("generator"))
                     theta = theta_from_pre(sampled_pre["u_pre"], sampled_pre["alpha_pre"],
-                                           self.mcfg.u_max, sampled_pre.get("gamma_pre"))
+                                           self.mcfg.u_max, sampled_pre.get("gamma_pre"), sampled_pre.get("eta_pre"))
                     theta_logp = theta_logp + decision_logp * (~st.done).float()
                 else:
-                    theta = {key: controls[key] for key in ("u", "alpha", "gamma") if key in controls}
+                    theta = {key: controls[key] for key in ("u", "alpha", "gamma", "eta") if key in controls}
                 if self.mcfg.theta_update == "static":
                     theta_static = theta
             elif theta_static is not None:
@@ -479,7 +530,7 @@ class ConstrainedMKPPolicy(nn.Module):
             # Fixed overrides are a decision at t=0 for trace/statistics only.
             is_decision = decision or (theta_override is not None and st.t == 0)
             with torch.profiler.record_function("t1r/executor"):
-                logits, lam = self.decoder(st, theta)
+                logits, lam, raw_std = self.decoder(st, theta, return_raw_std=True)
             valid = st.fits if self.decoder.mode == "hard_mask" else st.available
             if not bool(torch.isfinite(logits[valid]).all()):
                 raise FloatingPointError("Non-finite scores on candidate items")
@@ -505,8 +556,8 @@ class ConstrainedMKPPolicy(nn.Module):
                 stats["u_boundary_frac"] += ((theta["u"].abs() > .95*self.mcfg.u_max).float().mean(1)*active).sum()/n_act
                 if "gamma" in theta:
                     stats["gamma_mean"] += (theta["gamma"] * active).sum()/n_act
-                raw, _ = self.decoder.raw_scores(st, theta)
-                _, raw_std = self.decoder.moments(raw, st.fits)
+                if "eta" in theta:
+                    stats["eta_mean"] += (theta["eta"] * active).sum()/n_act
                 stats["raw_score_std"] += (raw_std.squeeze(1)*active).sum()/n_act
                 n_stat += 1
                 if return_trace:
@@ -518,6 +569,8 @@ class ConstrainedMKPPolicy(nn.Module):
                                   "fits_before": st.fits.gather(1, action[:, None]).squeeze(1).cpu()})
                     if "gamma" in theta:
                         trace[-1]["gamma"] = theta["gamma"].detach().cpu()
+                    if "eta" in theta:
+                        trace[-1]["eta"] = theta["eta"].detach().cpu()
                     if theta_noise is not None and is_decision:
                         trace[-1]["pre_mean"] = {k: v.detach().cpu() for k, v in pre_means.items()}
                         trace[-1]["pre_sample"] = {k: v.detach().cpu() for k, v in sampled_pre.items()}
@@ -529,7 +582,8 @@ class ConstrainedMKPPolicy(nn.Module):
                "u_abs_mean": float(stats["u_abs_mean"] / max(n_stat, 1)),
                "alpha_mean": float(stats["alpha_mean"] / max(n_stat, 1)),
                "temperature": float(global_T.detach()),
-               "theta_dim": inst.M + int("alpha" in self.mcfg.theta_groups) + int("block" in self.mcfg.theta_groups),
+               "theta_dim": inst.M + int("alpha" in self.mcfg.theta_groups) + int("block" in self.mcfg.theta_groups) + int("lp" in self.mcfg.theta_groups),
+               "lp_time_s": lp_time_s, "root_lp_time_s": root_lp_time_s, "lp_refreshes": lp_refreshes,
                "theta_logp": theta_logp}
         out.update({k: float(v / max(n_stat, 1)) for k, v in stats.items()})
         if return_trace:

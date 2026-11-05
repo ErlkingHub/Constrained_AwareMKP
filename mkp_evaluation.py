@@ -88,7 +88,8 @@ def summarize(rows):
         for field in ("time_lp_s", "time_construct_s", "time_refine_s", "time_total_s"):
             item["mean_" + field] = float(np.mean([float(r[field]) for r in values]))
         for field in ("theta_decisions", "decision_u_abs_mean", "decision_alpha_mean",
-                      "decision_alpha_std", "decision_gamma_mean"):
+                      "decision_alpha_std", "decision_gamma_mean", "decision_eta_mean",
+                      "time_root_lp_s", "time_residual_lp_s"):
             present = [float(r[field]) for r in values if r.get(field) not in (None, "")]
             if present:
                 item["mean_" + field] = float(np.mean(present))

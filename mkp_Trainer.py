@@ -48,6 +48,10 @@ def _check_checkpoint(ck, expected_model=None):
     model_cfg.setdefault("theta_interval", 1)
     model_cfg.setdefault("block_gamma_init", 0.1)
     model_cfg.setdefault("block_chunk_size", 64)
+    model_cfg.setdefault("lp_source", "root")
+    model_cfg.setdefault("lp_interval", 8)
+    model_cfg.setdefault("lp_eta_init", 0.5)
+    model_cfg.setdefault("alpha_init", 1.0)
     legacy = {"residual_max", "primitives", "init_primitive", "init_primitive_logit",
               "kappa_init", "kappa_min", "price_log_range"}.intersection(model_cfg)
     legacy_weights = any(any(part in key for part in ("res_head", "prim_head", "kappa_head"))
@@ -74,6 +78,7 @@ def _training_contract(values):
         contract.update({"theta_pg_sigma_u": values.get("theta_pg_sigma_u", 0.05),
                          "theta_pg_sigma_alpha": values.get("theta_pg_sigma_alpha", 0.3),
                          "theta_pg_sigma_gamma": values.get("theta_pg_sigma_gamma", 0.3),
+                         "theta_pg_sigma_eta": values.get("theta_pg_sigma_eta", 0.3),
                          "theta_pg_antithetic": values.get("theta_pg_antithetic", True)})
     else:
         contract["entropy_coef"] = values.get("entropy_coef", 0.01)
@@ -116,7 +121,7 @@ class MKPTrainer:
         if tc.signal not in ("item_pg", "theta_pg"):
             raise ValueError("train.signal must be item_pg or theta_pg")
         if tc.signal == "theta_pg":
-            for name in ("theta_pg_sigma_u", "theta_pg_sigma_alpha", "theta_pg_sigma_gamma"):
+            for name in ("theta_pg_sigma_u", "theta_pg_sigma_alpha", "theta_pg_sigma_gamma", "theta_pg_sigma_eta"):
                 if not math.isfinite(getattr(tc, name)) or getattr(tc, name) <= 0:
                     raise ValueError(f"train.{name} must be positive and finite")
             if tc.theta_pg_antithetic and tc.num_samples % 2:
@@ -321,6 +326,9 @@ class MKPTrainer:
                                                        "dual_iters", "dual_lr", "feasibility_mode",
                                                        "reject_penalty", "soft_mask_beta")
                            if old_env.get(name) != getattr(self.cfg.env, name))
+            changed.extend("env." + name for name, default in (("residual_lp_iters", 300),
+                                                               ("residual_lp_lr", 0.02))
+                           if old_env.get(name, default) != getattr(self.cfg.env, name))
             if changed:
                 raise ValueError("Resume cannot reuse best_val after changing validation: " + ", ".join(changed))
             self.optimizer.load_state_dict(ck["optimizer"])
@@ -359,10 +367,13 @@ class MKPTrainer:
         theta_pg = tc.signal == "theta_pg"
         if "block" in self.cfg.model.theta_groups:
             agg["gamma_mean"] = 0.0
+        if "lp" in self.cfg.model.theta_groups:
+            agg["eta_mean"] = 0.0
         if theta_pg:
             agg.update({"R_mean": 0.0, "frac_better": 0.0, "adv_zero_frac": 0.0})
         noise = ({"sigma_u": tc.theta_pg_sigma_u, "sigma_alpha": tc.theta_pg_sigma_alpha,
-                  "sigma_gamma": tc.theta_pg_sigma_gamma, "antithetic": tc.theta_pg_antithetic}
+                  "sigma_gamma": tc.theta_pg_sigma_gamma, "sigma_eta": tc.theta_pg_sigma_eta,
+                  "antithetic": tc.theta_pg_antithetic}
                  if theta_pg else None)
         for s in range(0, B, per_chunk):
             e = min(B, s + per_chunk)
@@ -409,6 +420,8 @@ class MKPTrainer:
                     agg[key] += float(out[key]) * frac
                 if "gamma_mean" in agg:
                     agg["gamma_mean"] += float(out["gamma_mean"]) * frac
+                if "eta_mean" in agg:
+                    agg["eta_mean"] += float(out["eta_mean"]) * frac
         gn = torch.nn.utils.clip_grad_norm_(self.model.parameters(), tc.grad_clip)
         finite_gradients = bool(torch.isfinite(gn))
         if finite_gradients:
@@ -484,6 +497,8 @@ class MKPTrainer:
                     if tc.signal == "theta_pg":
                         msg += (f" | R_mean {st['R_mean']:.4f} | frac_better {st['frac_better']:.3f} "
                                 f"| adv_zero_frac {st['adv_zero_frac']:.3f}")
+                    if "eta_mean" in st:
+                        msg += f" | eta {st['eta_mean']:.3f}"
                     self.log(msg)
             is_best = False
             epoch_val = ""

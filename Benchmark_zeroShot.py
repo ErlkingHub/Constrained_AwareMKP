@@ -45,6 +45,7 @@ def _audit(solution, inst):
 def _decision_statistics(traces):
     """Summarize active trajectories at controller decision points, not held steps."""
     u_sum, u_count, alpha_sum, alpha_sq, decisions, gamma_sum, gamma_count = 0., 0, 0., 0., 0, 0., 0
+    eta_sum, eta_count = 0., 0
     for trace in traces:
         for step in trace:
             if not step.get("theta_decision", True) or "u" not in step or "alpha" not in step:
@@ -61,11 +62,16 @@ def _decision_statistics(traces):
                 gamma = torch.as_tensor(step["gamma"])[active]
                 gamma_sum += float(gamma.sum())
                 gamma_count += gamma.numel()
+            if "eta" in step:
+                eta = torch.as_tensor(step["eta"])[active]
+                eta_sum += float(eta.sum())
+                eta_count += eta.numel()
     alpha_mean = alpha_sum / max(decisions, 1)
     return {"theta_decisions": decisions, "decision_u_abs_mean": u_sum / max(u_count, 1),
             "decision_alpha_mean": alpha_mean,
             "decision_alpha_std": math.sqrt(max(0., alpha_sq / max(decisions, 1) - alpha_mean ** 2)),
-            "decision_gamma_mean": gamma_sum / gamma_count if gamma_count else ""}
+            "decision_gamma_mean": gamma_sum / gamma_count if gamma_count else "",
+            "decision_eta_mean": eta_sum / eta_count if eta_count else ""}
 
 
 @torch.no_grad()
@@ -95,6 +101,7 @@ def evaluate_stage(model, env, inst, ec, device, amp, pre, stage, arm, seed, ins
     gen = torch.Generator(device="cpu").manual_seed(rng_seed)
     mu, ub = pre
     sols, objs, traces = [], [], []
+    residual_lp_seconds = 0.0
     _sync(device)
     start, remaining, offset, artifact_seconds = time.perf_counter(), spec["budget"], 0, 0.0
     while remaining:
@@ -106,6 +113,7 @@ def evaluate_stage(model, env, inst, ec, device, amp, pre, stage, arm, seed, ins
             out = model(env, inst, num_samples=k, decode=spec["decode"],
                         temperature=ec.sample_temperature, amp=amp, pre=pre,
                         return_trace=True, **kwargs)
+        residual_lp_seconds += float(out.get("lp_time_s", 0.0))
         sols.append(out["solution"])
         objs.append(out["profit"])
         traces.append(out.get("trace", []))
@@ -119,7 +127,7 @@ def evaluate_stage(model, env, inst, ec, device, amp, pre, stage, arm, seed, ins
         remaining -= k
         offset += k
     _sync(device)
-    construction_seconds = time.perf_counter() - start - artifact_seconds
+    construction_seconds = time.perf_counter() - start - artifact_seconds - residual_lp_seconds
     solution, objective = torch.cat(sols), torch.cat(objs)
     theta_stats = _decision_statistics(traces)
     _audit(solution, inst)
@@ -152,9 +160,10 @@ def evaluate_stage(model, env, inst, ec, device, amp, pre, stage, arm, seed, ins
         refine_seconds = time.perf_counter() - start - artifact_seconds
         _audit(best_solution, inst)
     return {"stage": stage, "budget": spec["budget"], "objective": best_obj,
-            "ub_lp": float(ub[0]), "time_lp_s": root_lp_seconds,
+            "ub_lp": float(ub[0]), "time_lp_s": root_lp_seconds + residual_lp_seconds,
+            "time_root_lp_s": root_lp_seconds, "time_residual_lp_s": residual_lp_seconds,
             "time_construct_s": construction_seconds, "time_refine_s": refine_seconds,
-            "time_total_s": root_lp_seconds + construction_seconds + refine_seconds,
+            "time_total_s": root_lp_seconds + residual_lp_seconds + construction_seconds + refine_seconds,
             "search_starts": pool_size, "ils_rounds": ec.ils_rounds if spec["refine"] else 0,
             "ls_max_iters": ec.ls_max_iters if spec["refine"] else 0,
             "ls_drop_k": ec.ls_drop_k if spec["refine"] else 0,
@@ -219,7 +228,8 @@ def _protocol(cfg, include_schedule):
     omitted = () if include_schedule else ("theta_update", "theta_interval", "untrained_random_heads")
     for key in omitted:
         model.pop(key, None)
-    return {"formula": "weak_decoder_t2_block_v1" if "block" in cfg.model.theta_groups else
+    return {"formula": "weak_decoder_t3_lp_v1" if ("lp" in cfg.model.theta_groups or cfg.model.price_anchor == "residual") else
+                "weak_decoder_t2_block_v1" if "block" in cfg.model.theta_groups else
                 ("weak_decoder_t1r_zscore_v1" if cfg.model.score_normalization else "weak_decoder_t1_g0g1_v1"),
                 "model": model, "env": cfg.to_dict()["env"],
                 "sampling": "exact-K-excluding-greedy", "search": "top-pool-retaining-duplicates",
@@ -305,7 +315,8 @@ def main(argv=None):
             "primary_stage_evaluated": "greedy" in stages,
             "reference": "Chu best-known values; not proven optima",
             "timing": "GPU synchronized; root LP shared per instance, charged once to each arm/stage. "
-                      "Construction includes per-step theta trace capture/CPU copies. Decision-point theta "
+                      "Residual LP refresh time is reported separately and included in total LP time. "
+                      "Construction excludes residual LP but includes per-step theta trace capture/CPU copies. Decision-point theta "
                       "statistics, JSON serialization, artifact output, audits and model loading excluded.",
             "protocol": "sampleK is K samples excluding greedy. ILS retains duplicate starts for matched budgets. "
                         "Stage RNG resets by evaluation seed, instance ID and stage, independently of arm.",

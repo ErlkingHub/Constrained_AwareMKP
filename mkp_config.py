@@ -73,6 +73,8 @@ class EnvConfig:
     # Batched Lagrangian-dual (LP relaxation) approximation used for features + bound.
     dual_iters: int = 300
     dual_lr: float = 0.05
+    residual_lp_iters: int = 300          # 30 failed required residual LP accuracy checks
+    residual_lp_lr: float = 0.02
 
 
 # --------------------------------------------------------------------------------------
@@ -95,6 +97,10 @@ class ModelConfig:
     # G0+G1 by default; opt-in block group is prepared for gated T2 experiments.
     theta_groups: List[str] = field(default_factory=lambda: ["price", "alpha"])
     price_anchor: str = "root"
+    lp_source: str = "root"
+    lp_interval: int = 8
+    lp_eta_init: float = 0.5
+    alpha_init: float = 1.0
     u_max: float = 3.0                   # tanh bound before centering (sum_j u_j = 0)
     theta_update: str = "step"           # step | static (static must be trained separately)
     theta_interval: int = 1              # decision times 0,k,2k,...; T1-P dynamic uses 8
@@ -117,6 +123,7 @@ class TrainConfig:
     theta_pg_sigma_u: float = 0.05
     theta_pg_sigma_alpha: float = 0.3
     theta_pg_sigma_gamma: float = 0.3
+    theta_pg_sigma_eta: float = 0.3
     theta_pg_antithetic: bool = True
     initial_validation: bool = True
     gate_early_stop: bool = False
