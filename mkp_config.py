@@ -112,6 +112,10 @@ class ModelConfig:
     untrained_random_heads: bool = False # True only for the untrained control arm
     price_floor: float = 0.05             # floor (relative to mean dual price) for non-binding dims
     grad_checkpoint: bool = True          # checkpoint the per-step controller (saves memory)
+    theta_sigma_head: bool = False
+    theta_sigma_u0: float = 0.05
+    theta_sigma_alpha0: float = 0.3
+    theta_sigma_dims: str = "ua"
 
 
 # --------------------------------------------------------------------------------------
@@ -119,7 +123,7 @@ class ModelConfig:
 # --------------------------------------------------------------------------------------
 @dataclass
 class TrainConfig:
-    signal: str = "theta_pg"             # theta_pg | item_pg (legacy checkpoints)
+    signal: str = "theta_pg"             # theta_pg | theta_maxk | item_pg (legacy)
     theta_pg_sigma_u: float = 0.05
     theta_pg_sigma_alpha: float = 0.3
     theta_pg_sigma_gamma: float = 0.3
@@ -144,6 +148,7 @@ class TrainConfig:
     # Fixed synthetic validation only; Chu instances never select checkpoints.
     validation_reference: str = "milp"   # milp | lp (LP is an explicit diagnostic)
     val_seed: int = 20240607
+    val_noise_seed: int = 20261106        # fixed common random draws for max@K validation
     val_milp_time_limit: float = 10.0
     val_mip_rel_gap: float = 1e-9
     reference_cache: str = "cache"
@@ -175,6 +180,9 @@ class EvalConfig:
     num_samples: int = 256                # exact K for sampleK (greedy is a separate stage)
     sample_temperature: float = 1.0
     max_rollouts_per_chunk: int = 2048
+    sms_dims: str = "ua"
+    sms_scale: float = 1.0
+    sms_include_center: bool = True
 
     # External refinement stages; equal ls_pool startup budgets apply to every arm.
     ls_enable: bool = False

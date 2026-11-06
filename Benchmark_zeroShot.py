@@ -23,6 +23,7 @@ from mkp_config import build_arg_parser, get_config, get_device, resolve_path
 from mkp_env import MKPEnv, instances_from_dicts
 from mkp_evaluation import ARMS, paired_report, paired_seed, parse_stages, summarize, write_csv, jsonable
 from mkp_Model import build_model
+from mkp_sms import sms_rollouts
 from mkp_refine import greedy_fill, is_feasible, iterated_local_search, _ratio
 from mkp_Trainer import load_policy, set_seed
 from read_mat import read_mat
@@ -94,7 +95,8 @@ def _historical_rollout(env, inst, pre, k, decode, temperature):
 
 @torch.no_grad()
 def evaluate_stage(model, env, inst, ec, device, amp, pre, stage, arm, seed, instance_id,
-                   root_lp_seconds=0.0, artifact_sink=None):
+                   root_lp_seconds=0.0, artifact_sink=None, return_candidates=False,
+                   centered_samples=False, sms_tag=0):
     spec = parse_stages([stage], ec.num_samples)[0]
     rng_seed = paired_seed(seed, instance_id, stage)
     set_seed(rng_seed)
@@ -102,30 +104,51 @@ def evaluate_stage(model, env, inst, ec, device, amp, pre, stage, arm, seed, ins
     mu, ub = pre
     sols, objs, traces = [], [], []
     residual_lp_seconds = 0.0
+    is_sms = "theta_k" in spec
+    if is_sms and arm not in ("fixed", "learned_static", "learned_mu_only"):
+        raise ValueError("SMS stages require fixed or a static learned proposal arm")
+    if inst.B != 1 or ec.max_rollouts_per_chunk < 1:
+        raise ValueError("Stage evaluation requires B=1 and a positive rollout chunk")
+    if centered_samples and spec["decode"] != "sample" and not is_sms:
+        raise ValueError("centered_samples applies only to item-sampling stages")
+
+    def traditional_rollouts():
+        remaining, offset = spec["budget"], 0
+        while remaining:
+            center = centered_samples and offset == 0
+            k = 1 if center else min(remaining, ec.max_rollouts_per_chunk)
+            decode = "greedy" if center else spec["decode"]
+            if arm == "fixed_dualgreedy":
+                out = _historical_rollout(env, inst, pre, k, decode, ec.sample_temperature)
+            else:
+                kwargs = {"theta_override": "fixed"} if arm == "fixed" else {}
+                out = model(env, inst, num_samples=k, decode=decode,
+                            temperature=ec.sample_temperature, amp=amp, pre=pre,
+                            return_trace=True, **kwargs)
+            yield offset, out
+            remaining -= k
+            offset += k
+
     _sync(device)
-    start, remaining, offset, artifact_seconds = time.perf_counter(), spec["budget"], 0, 0.0
-    while remaining:
-        k = min(remaining, ec.max_rollouts_per_chunk)
-        if arm == "fixed_dualgreedy":
-            out = _historical_rollout(env, inst, pre, k, spec["decode"], ec.sample_temperature)
-        else:
-            kwargs = {"theta_override": "fixed"} if arm == "fixed" else {}
-            out = model(env, inst, num_samples=k, decode=spec["decode"],
-                        temperature=ec.sample_temperature, amp=amp, pre=pre,
-                        return_trace=True, **kwargs)
+    start, artifact_seconds = time.perf_counter(), 0.0
+    rollouts = (sms_rollouts(model, env, inst, pre, ec, spec, arm, seed, instance_id,
+                            amp=amp, tag=sms_tag, return_trace=True) if is_sms else traditional_rollouts())
+    sms_proposal = None
+    for offset, out in rollouts:
         residual_lp_seconds += float(out.get("lp_time_s", 0.0))
         sols.append(out["solution"])
         objs.append(out["profit"])
         traces.append(out.get("trace", []))
+        if out.get("sms_proposal") is not None:
+            sms_proposal = out["sms_proposal"]
         if artifact_sink is not None:
             _sync(device)
             astart = time.perf_counter()
             artifact_sink({"arm": arm, "stage": stage, "sample_offset": offset,
                            "solutions": out["solution"], "objectives": out["profit"],
-                           "theta_trace": out.get("trace", [])})
+                           "theta_trace": out.get("trace", []),
+                           "sms_proposal": out.get("sms_proposal")})
             artifact_seconds += time.perf_counter() - astart
-        remaining -= k
-        offset += k
     _sync(device)
     construction_seconds = time.perf_counter() - start - artifact_seconds - residual_lp_seconds
     solution, objective = torch.cat(sols), torch.cat(objs)
@@ -159,7 +182,7 @@ def evaluate_stage(model, env, inst, ec, device, amp, pre, stage, arm, seed, ins
         _sync(device)
         refine_seconds = time.perf_counter() - start - artifact_seconds
         _audit(best_solution, inst)
-    return {"stage": stage, "budget": spec["budget"], "objective": best_obj,
+    result = {"stage": stage, "budget": spec["budget"], "objective": best_obj,
             "ub_lp": float(ub[0]), "time_lp_s": root_lp_seconds + residual_lp_seconds,
             "time_root_lp_s": root_lp_seconds, "time_residual_lp_s": residual_lp_seconds,
             "time_construct_s": construction_seconds, "time_refine_s": refine_seconds,
@@ -171,23 +194,43 @@ def evaluate_stage(model, env, inst, ec, device, amp, pre, stage, arm, seed, ins
             "sample_temperature": ec.sample_temperature, "rng_seed": rng_seed,
             "solution": best_solution[0].to(torch.int8).cpu().tolist(), "feasible": True, "maximal": True,
             **theta_stats}
+    if is_sms:
+        registered_dims = (model.mcfg.theta_sigma_dims if getattr(model.mcfg, "theta_sigma_head", False)
+                           else ec.sms_dims)
+        result.update({"theta_k": spec["theta_k"], "item_k": spec["item_k"],
+                       "sms_dims": registered_dims, "sms_scale": ec.sms_scale,
+                       "sms_include_center": ec.sms_include_center, "sms_tag": sms_tag, "sms_seed": seed,
+                       "sigma_u_mean": float(sms_proposal["sigma_u"].mean()),
+                       "sigma_alpha": float(sms_proposal["sigma_alpha"]),
+                       "candidate_order": "theta-major; candidate0 is mean-theta greedy when include_center"})
+    if return_candidates:
+        result.update({"candidate_solutions": solution.detach(), "candidate_objectives": objective.detach(),
+                       "candidate_budget": spec["budget"], "centered_samples": centered_samples,
+                       "candidate_phase": "construction pool before optional ILS",
+                       "candidate_pool_timing": "time_construct_s covers the entire returned pool; no prefix timing inference"})
+    return result
 
 
 def _load_arms(cfg, arms, checkpoint, static_checkpoint, device):
     models, configs, checkpoints = {}, {}, {}
     reference_cfg, training_seed = cfg, cfg.device.seed
     load_names = [a for a in arms if a.startswith("learned_")]
-    if not load_names and checkpoint:
+    if not load_names and (checkpoint or static_checkpoint):
         load_names = ["reference"]
     for name in load_names:
-        path = static_checkpoint if name == "learned_static" and static_checkpoint else checkpoint
+        if name == "reference":
+            path = checkpoint or static_checkpoint
+        else:
+            path = static_checkpoint if name in ("learned_static", "learned_mu_only") and static_checkpoint else checkpoint
         path = resolve_path(path or cfg.eval.checkpoint)
         model, mc, ck = load_policy(path, device, cfg_override=cfg)
         if name.startswith("learned_"):
-            expected = "static" if name == "learned_static" else "step"
+            expected = "static" if name in ("learned_static", "learned_mu_only") else "step"
             if mc.model.theta_update != expected:
                 raise ValueError(f"{name} requires a separately trained theta_update={expected} checkpoint; "
                                  f"{path} was trained with {mc.model.theta_update}")
+            if name == "learned_mu_only" and not getattr(mc.model, "theta_sigma_head", False):
+                raise ValueError("learned_mu_only requires a static max@K checkpoint with a sigma head")
         ck_seed = int(ck.get("config", {}).get("device", {}).get("seed", cfg.device.seed))
         if checkpoints:
             if ck_seed != training_seed:
@@ -212,7 +255,7 @@ def _load_arms(cfg, arms, checkpoint, static_checkpoint, device):
         mc = copy.deepcopy(reference_cfg)
         # The untrained primary control always uses per-step theta, independent
         # of the order in which static/dynamic checkpoints were requested.
-        mc.model.theta_update = "step"
+        mc.model.theta_update = "static" if getattr(mc.model, "theta_sigma_head", False) else "step"
         mc.model.theta_interval = 1
         mc.model.untrained_random_heads = name == "untrained"
         set_seed(training_seed)
@@ -232,6 +275,12 @@ def _protocol(cfg, include_schedule):
                 "weak_decoder_t2_block_v1" if "block" in cfg.model.theta_groups else
                 ("weak_decoder_t1r_zscore_v1" if cfg.model.score_normalization else "weak_decoder_t1_g0g1_v1"),
                 "model": model, "env": cfg.to_dict()["env"],
+                "sms": {"dims": getattr(cfg.eval, "sms_dims", "ua"),
+                        "scale": getattr(cfg.eval, "sms_scale", 1.),
+                        "include_center": getattr(cfg.eval, "sms_include_center", True),
+                        "sigma_fixed_source": "checkpoint sigma0 when sigma head is enabled; otherwise .05/.3 times sms_scale",
+                        "draws": "independent per-theta-index seed; M+1 normals; no antithetic",
+                        "hybrid": "theta-major; candidate0 mean greedy, all remaining item-sampled"},
                 "sampling": "exact-K-excluding-greedy", "search": "top-pool-retaining-duplicates",
                 "global_temperature": "initial-for-controls-fitted-for-learned"}
 
@@ -241,9 +290,12 @@ def protocol_sha256(cfg):
     return hashlib.sha256(json.dumps(_protocol(cfg, include_schedule=False), sort_keys=True).encode()).hexdigest()
 
 
-def arm_protocol_sha256(cfg):
+def arm_protocol_sha256(cfg, arm=None):
     """Full method signature, including checkpoint-defined theta_update and interval."""
-    return hashlib.sha256(json.dumps(_protocol(cfg, include_schedule=True), sort_keys=True).encode()).hexdigest()
+    protocol = _protocol(cfg, include_schedule=True)
+    if arm == "learned_mu_only":
+        protocol["proposal_sigma_override"] = "registered sigma0; learned mean retained"
+    return hashlib.sha256(json.dumps(protocol, sort_keys=True).encode()).hexdigest()
 
 
 def main(argv=None):
@@ -307,7 +359,7 @@ def main(argv=None):
             "dataset": path, "data_sha256": sha256_file(path), "instance_ids": [d["id"] for d in data],
             "checkpoints": checkpoints, "training_seed": training_seed,
             "evaluation_seed": cfg.device.seed, "arms": arms, "stages": stages,
-            "protocol_sha256": {a: arm_protocol_sha256(configs[a]) for a in arms},
+            "protocol_sha256": {a: arm_protocol_sha256(configs[a], arm=a) for a in arms},
             "comparison_protocol_sha256": {a: protocol_sha256(configs[a]) for a in arms},
             "theta_schedules": {a: {"theta_update": configs[a].model.theta_update,
                                      "theta_interval": configs[a].model.theta_interval} for a in arms},
@@ -320,6 +372,12 @@ def main(argv=None):
                       "statistics, JSON serialization, artifact output, audits and model loading excluded.",
             "protocol": "sampleK is K samples excluding greedy. ILS retains duplicate starts for matched budgets. "
                         "Stage RNG resets by evaluation seed, instance ID and stage, independently of arm.",
+            "sms_protocol": "thetaK samples static u/alpha proposals and runs greedy; hybAxB repeats each "
+                            "of A theta proposals B times in theta-major order. Proposal indices use independent "
+                            "seeds and are generated before chunking. With sms_include_center, candidate0 is "
+                            "mean-theta greedy; every other hybrid candidate is item-sampled. Hybrid item "
+                            "rollouts use independent trajectory seeds and one policy call per candidate to "
+                            "keep prefixes invariant to rollout chunking; this overhead is included in timing.",
             "schedule_comparison": "Each learned arm inherits its trained theta_interval without an inference "
                                    "override. Full protocol SHA includes update mode and interval. Comparison "
                                    "SHA excludes only theta_update, theta_interval and untrained_random_heads "

@@ -169,33 +169,68 @@ def theta_from_pre(v, z, u_max, g=None, h=None):
 
 
 def theta_pre_log_prob(means, draws, sigmas):
-    """Gaussian score function: draws are constants, sigmas are not learned."""
+    """Detached-action score function; tensor scales include their -log(sigma).
+
+    The fixed Python-float path retains T1-P's constant-free density verbatim.
+    Tensor scales omit only Normal's constant -log(2*pi)/2 per active dimension.
+    Zero scales describe deterministic dimensions and contribute no score term.
+    """
     logp = torch.zeros_like(means["alpha_pre"])
     for name, mean in means.items():
-        term = -0.5 * ((draws[name].detach() - mean) / float(sigmas[name])).square()
+        sigma = sigmas[name]
+        if torch.is_tensor(sigma):
+            sigma = sigma.to(device=mean.device, dtype=mean.dtype)
+            active = sigma > 0
+            safe = torch.where(active, sigma, torch.ones_like(sigma))
+            term = (-0.5 * ((draws[name].detach() - mean) / safe).square()
+                    - safe.log()).masked_fill(~active, 0.0)
+        else:
+            if float(sigma) == 0:
+                continue
+            term = -0.5 * ((draws[name].detach() - mean) / float(sigma)).square()
         logp = logp + (term.sum(1) if term.ndim == 2 else term)
     return logp
 
 
-def sample_theta_pre(means, sigmas, batch_size, num_samples, antithetic=False, generator=None):
-    """Detached Gaussian draws and score-function log density (fixed sigma)."""
+def sample_theta_pre(means, sigmas, batch_size, num_samples, antithetic=False,
+                     generator=None, include_center=False):
+    """Detached Gaussian draws; zero scales are deterministic and are not sampled."""
     if antithetic and num_samples % 2:
         raise ValueError("Antithetic theta sampling requires even num_samples")
+    if antithetic and include_center:
+        raise ValueError("Center insertion is incompatible with antithetic pairs")
     draws = {}
     for name, mean in means.items():
-        sigma = float(sigmas[name])
-        if not math.isfinite(sigma) or sigma <= 0:
-            raise ValueError("Theta noise sigmas must be positive and finite")
-        tail = mean.shape[1:]
-        shape = (batch_size, num_samples // 2 if antithetic else num_samples, *tail)
-        noise_device = mean.device if generator is None else generator.device
-        eps = torch.randn(shape, generator=generator, device=noise_device).to(mean.device)
-        if antithetic:
-            eps = torch.stack((eps, -eps), dim=2)
-        eps = eps.reshape_as(mean)
-        draw = (mean + sigma * eps).detach()
+        sigma = sigmas[name]
+        if torch.is_tensor(sigma):
+            sigma = sigma.to(device=mean.device, dtype=mean.dtype)
+            if not bool(torch.isfinite(sigma).all()) or bool((sigma < 0).any()):
+                raise ValueError("Theta noise scales must be finite and nonnegative")
+            enabled = bool((sigma > 0).any())
+        else:
+            sigma = float(sigma)
+            if not math.isfinite(sigma) or sigma < 0:
+                raise ValueError("Theta noise scales must be finite and nonnegative")
+            enabled = sigma > 0
+        if enabled:
+            shape = (batch_size, num_samples // 2 if antithetic else num_samples, *mean.shape[1:])
+            noise_device = mean.device if generator is None else generator.device
+            eps = torch.randn(shape, generator=generator, device=noise_device).to(mean.device)
+            if antithetic:
+                eps = torch.stack((eps, -eps), dim=2)
+            draw = (mean + sigma * eps.reshape_as(mean)).detach()
+        else:
+            draw = mean.detach().clone()
+        if include_center:
+            draw = draw.clone()
+            draw[::num_samples] = mean.detach()[::num_samples]
         draws[name] = draw
-    return draws, theta_pre_log_prob(means, draws, sigmas)
+    logp = theta_pre_log_prob(means, draws, sigmas)
+    if include_center:
+        mask = torch.ones_like(logp)
+        mask[::num_samples] = 0
+        logp = logp * mask
+    return draws, logp
 
 
 class StrategyController(nn.Module):
@@ -218,16 +253,29 @@ class StrategyController(nn.Module):
         self.ln_x, self.ln_y = nn.LayerNorm(d), nn.LayerNorm(d)
         self.ctx = nn.Sequential(nn.Linear(4 * d, d), nn.GELU(), nn.Linear(d, d))
         self.price_head = nn.Sequential(nn.Linear(2 * d, d), nn.GELU(), nn.Linear(d, 1))
-        self.scalar_head = nn.Linear(d, len(self.scalar_names)) if self.scalar_names else None
+        if cfg.theta_sigma_head:
+            if set(groups) != {"price", "alpha"}:
+                raise ValueError("SMS proposal heads require the F0 price/alpha interface")
+            self.sigma_u_head = nn.Linear(2*d, 1)
+        scalar_count = len(self.scalar_names) + int(cfg.theta_sigma_head)
+        self.scalar_head = nn.Linear(d, scalar_count) if scalar_count else None
         self._init_heads()
 
     def _init_heads(self):
+        if self.cfg.theta_sigma_head:
+            nn.init.zeros_(self.sigma_u_head.weight)
+            nn.init.zeros_(self.sigma_u_head.bias)
         if self.cfg.untrained_random_heads:
-            return  # Preserve PyTorch's default random head initialization for this control.
+            if self.cfg.theta_sigma_head:
+                with torch.no_grad():
+                    self.scalar_head.weight[-1].zero_()
+                    self.scalar_head.bias[-1].zero_()
+            return  # Preserve PyTorch's default random mean-head initialization for this control.
         nn.init.zeros_(self.price_head[-1].weight)
         nn.init.zeros_(self.price_head[-1].bias)
         if self.scalar_head is not None:
             nn.init.zeros_(self.scalar_head.weight)
+            nn.init.zeros_(self.scalar_head.bias)
             with torch.no_grad():
                 for index, name in enumerate(self.scalar_names):
                     if name == "alpha":
@@ -251,7 +299,13 @@ class StrategyController(nn.Module):
         cfg = self.cfg
         M = y.shape[1]
         v = self.price_head(torch.cat([y, ctx[:, None, :].expand(-1, M, -1)], -1)).squeeze(-1).float()
-        scalars = self.scalar_head(ctx).float() if self.scalar_head is not None else None
+        if cfg.theta_sigma_head:
+            # New proposal heads keep their registered zero-init center exact
+            # under AMP. The legacy head-disabled arithmetic stays unchanged.
+            with torch.autocast(device_type=ctx.device.type, enabled=False):
+                scalars = self.scalar_head(ctx.float())
+        else:
+            scalars = self.scalar_head(ctx).float() if self.scalar_head is not None else None
         z = (scalars[:, self.scalar_names.index("alpha")] if "alpha" in self.scalar_names else
              torch.full_like(v[:, 0], math.log(((cfg.alpha_init-.5)/2)/(1-(cfg.alpha_init-.5)/2))))
         g_pre = scalars[:, self.scalar_names.index("block")] if "block" in self.scalar_names else None
@@ -262,6 +316,15 @@ class StrategyController(nn.Module):
             theta["gamma_pre"] = g_pre
         if h_pre is not None:
             theta["eta_pre"] = h_pre
+        if cfg.theta_sigma_head:
+            features = torch.cat([y, ctx[:, None, :].expand(-1, M, -1)], -1)
+            with torch.autocast(device_type=ctx.device.type, enabled=False):
+                su = self.sigma_u_head(features.float()).squeeze(-1)
+            sa = scalars[:, -1]
+            theta["sigma_u"] = (cfg.theta_sigma_u0 * torch.exp(1.5*torch.tanh(su))
+                                if "u" in cfg.theta_sigma_dims else torch.zeros_like(su))
+            theta["sigma_alpha"] = (cfg.theta_sigma_alpha0 * torch.exp(1.5*torch.tanh(sa))
+                                    if "a" in cfg.theta_sigma_dims else torch.zeros_like(sa))
         return theta
 
 
@@ -351,7 +414,15 @@ class ConstrainedMKPPolicy(nn.Module):
             raise ValueError("theta_interval must be a positive integer")
         if not math.isfinite(cfg.model.block_gamma_init) or cfg.model.block_gamma_init <= 0 or cfg.model.block_chunk_size < 1:
             raise ValueError("Block gamma initialization and chunk size must be positive")
+        if cfg.model.theta_sigma_dims not in ("u", "a", "ua"):
+            raise ValueError("theta_sigma_dims must be u, a or ua")
+        if any(not math.isfinite(v) or v <= 0 for v in (cfg.model.theta_sigma_u0,cfg.model.theta_sigma_alpha0)):
+            raise ValueError("SMS base scales must be positive and finite")
+        if cfg.model.theta_sigma_head and cfg.model.theta_update != "static":
+            raise ValueError("T4 learned proposals use static controls")
         self.theta_keys = ("u", "alpha", "u_pre", "alpha_pre")
+        if cfg.model.theta_sigma_head:
+            self.theta_keys += ("sigma_u", "sigma_alpha")
         if "block" in cfg.model.theta_groups:
             self.theta_keys += ("gamma", "gamma_pre")
         if "lp" in cfg.model.theta_groups:
@@ -383,10 +454,28 @@ class ConstrainedMKPPolicy(nn.Module):
             theta = self.controller(x, y, g, torch.cat([edge_s, edge_d], dim=-1), avail)
         return tuple(theta[key] for key in self.theta_keys)
 
+    def proposal_parameters(self, env, inst, pre=None, amp=False):
+        if self.mcfg.theta_update != "static":
+            raise ValueError("Proposal readout requires a static controller")
+        mu, ub = pre if pre is not None else env.precompute(inst)
+        item_s,res_s,edge_s = env.static_features(inst,mu,ub)
+        ctx = (torch.autocast("cuda", dtype=torch.bfloat16)
+               if amp and inst.p.device.type == "cuda" else nullcontext())
+        with ctx:
+            xs,ys = self.encoder.encode_static(item_s,res_s,edge_s)
+            st = env.reset(inst,mu,ub)
+            item_d,res_d,edge_d,glob = env.dynamic_features(st)
+            values = self._step_core(xs,ys,edge_s,item_d,res_d,edge_d,glob,st.available)
+        out = dict(zip(self.theta_keys,values))
+        if not self.mcfg.theta_sigma_head:
+            out["sigma_u"] = torch.full_like(out["u_pre"], self.mcfg.theta_sigma_u0 if "u" in self.mcfg.theta_sigma_dims else 0.)
+            out["sigma_alpha"] = torch.full_like(out["alpha_pre"], self.mcfg.theta_sigma_alpha0 if "a" in self.mcfg.theta_sigma_dims else 0.)
+        return {k:out[k] for k in ("u_pre","alpha_pre","sigma_u","sigma_alpha")}
+
     def forward(self, env: MKPEnv, inst: MKPInstances, num_samples: int = 1,
                 decode: str = "sample", temperature: float = 1.0, amp: bool = False,
                 pre: Optional[tuple] = None, return_trace: bool = False,
-                theta_override=None, theta_noise: Optional[dict] = None):
+                theta_override=None, theta_noise: Optional[dict] = None, sigma_override=None):
         """Construct feasible maximal solutions, with one trajectory for primary greedy.
 
         theta_override='fixed' skips the network entirely. A dict supplies explicit
@@ -477,6 +566,7 @@ class ConstrainedMKPPolicy(nn.Module):
             stats["gamma_mean"] = 0.0
         if "lp" in self.mcfg.theta_groups:
             stats["eta_mean"] = 0.0
+        sigma_stats = None
         n_stat = 0
         trace = [] if return_trace else None
         use_ckpt = self.training and self.mcfg.grad_checkpoint and torch.is_grad_enabled()
@@ -514,13 +604,28 @@ class ConstrainedMKPPolicy(nn.Module):
                               "alpha_pre": theta_noise.get("sigma_alpha", .3),
                               "gamma_pre": theta_noise.get("sigma_gamma", .3),
                               "eta_pre": theta_noise.get("sigma_eta", .3)}
+                    if self.mcfg.theta_sigma_head:
+                        sigmas["u_pre"], sigmas["alpha_pre"] = controls["sigma_u"], controls["sigma_alpha"]
+                    if sigma_override is not None:
+                        sigmas["u_pre"] = torch.as_tensor(sigma_override["sigma_u"], device=dev).expand_as(pre_means["u_pre"])
+                        sigmas["alpha_pre"] = torch.as_tensor(sigma_override["sigma_alpha"], device=dev).expand_as(pre_means["alpha_pre"])
                     sampled_pre, decision_logp = sample_theta_pre(
                         pre_means, sigmas, original_B, K,
                         antithetic=bool(theta_noise.get("antithetic", True)) and st.t == 0,
-                        generator=theta_noise.get("generator"))
+                        generator=theta_noise.get("generator"),
+                        include_center=bool(theta_noise.get("include_center", False)) and st.t == 0)
                     theta = theta_from_pre(sampled_pre["u_pre"], sampled_pre["alpha_pre"],
                                            self.mcfg.u_max, sampled_pre.get("gamma_pre"), sampled_pre.get("eta_pre"))
                     theta_logp = theta_logp + decision_logp * (~st.done).float()
+                    if self.mcfg.theta_sigma_head:
+                        with torch.no_grad():
+                            sigma_stats = {}
+                            for field,key in (("sigma_u","u_pre"),("sigma_alpha","alpha_pre")):
+                                value = torch.as_tensor(sigmas[key],device=dev).expand_as(pre_means[key])
+                                for stat in ("mean","min","max"):
+                                    sigma_stats[field+"_"+stat] = float(getattr(value,stat)())
+                            mean_u = theta_from_pre(pre_means["u_pre"],pre_means["alpha_pre"],self.mcfg.u_max)["u"]
+                            sigma_stats["proposal_u_abs_mean"] = float(mean_u.abs().mean())
                 else:
                     theta = {key: controls[key] for key in ("u", "alpha", "gamma", "eta") if key in controls}
                 if self.mcfg.theta_update == "static":
@@ -586,6 +691,8 @@ class ConstrainedMKPPolicy(nn.Module):
                "lp_time_s": lp_time_s, "root_lp_time_s": root_lp_time_s, "lp_refreshes": lp_refreshes,
                "theta_logp": theta_logp}
         out.update({k: float(v / max(n_stat, 1)) for k, v in stats.items()})
+        if sigma_stats is not None:
+            out.update(sigma_stats)
         if return_trace:
             out["trace"] = trace
         return out

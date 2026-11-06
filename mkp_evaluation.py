@@ -12,7 +12,7 @@ from pathlib import Path
 
 import numpy as np
 
-ARMS = ("fixed", "fixed_dualgreedy", "untrained", "learned_static", "learned_dynamic")
+ARMS = ("fixed", "fixed_dualgreedy", "untrained", "learned_static", "learned_dynamic", "learned_mu_only")
 BUDGET_FIELDS = ("stage", "budget", "search_starts", "ils_rounds", "ls_max_iters", "ls_drop_k",
                  "ils_perturb_max", "sample_temperature", "evaluation_seed", "data_sha256", "protocol_sha256")
 REPORT_FIELDS = tuple(k for k in BUDGET_FIELDS if k != "evaluation_seed")
@@ -35,9 +35,16 @@ def parse_stages(names, sample_k=256):
     specs = []
     for name in names:
         name = name.strip().replace("sampleK", f"sample{sample_k}")
+        sms = re.fullmatch(r"(theta([1-9][0-9]*)|hyb([1-9][0-9]*)x([1-9][0-9]*))(\+ILS)?", name)
+        if sms:
+            theta_k, item_k = (int(sms[2]), 1) if sms[2] else (int(sms[3]), int(sms[4]))
+            specs.append({"name": name, "decode": "greedy" if sms[2] else "sample",
+                          "budget": theta_k * item_k, "refine": bool(sms[5]),
+                          "theta_k": theta_k, "item_k": item_k})
+            continue
         match = re.fullmatch(r"(greedy|sample([1-9][0-9]*))(\+ILS)?", name)
         if not match:
-            raise ValueError(f"Invalid stage {name!r}; use greedy, sample64, sample256, greedy+ILS, sampleK+ILS")
+            raise ValueError(f"Invalid stage {name!r}; use greedy, sampleK, thetaK or hybAxB, optionally +ILS")
         specs.append({"name": name, "decode": "greedy" if match[1] == "greedy" else "sample",
                       "budget": int(match[2]) if match[2] else 1, "refine": bool(match[3])})
     if not specs or len({s["name"] for s in specs}) != len(specs):

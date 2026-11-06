@@ -9,6 +9,7 @@ mean reward of the K trajectories of the same instance, so no critic network is 
     A_k = R_k - mean_k' R_k'          (optionally divided by the batch std)
     item_pg : L = - E[A_k * log pi(tau_k)] - entropy_coef * H
     theta_pg: L = - E[A_k * sum_decisions log q(theta)] (greedy executor, fixed sigma)
+    theta_maxk: leave-one-out max@K advantages, independent static proposals, learned sigma
 
 Reward (hard-mask main method): profit / LP-bound.
 
@@ -52,6 +53,10 @@ def _check_checkpoint(ck, expected_model=None):
     model_cfg.setdefault("lp_interval", 8)
     model_cfg.setdefault("lp_eta_init", 0.5)
     model_cfg.setdefault("alpha_init", 1.0)
+    model_cfg.setdefault("theta_sigma_head", False)
+    model_cfg.setdefault("theta_sigma_u0", 0.05)
+    model_cfg.setdefault("theta_sigma_alpha0", 0.3)
+    model_cfg.setdefault("theta_sigma_dims", "ua")
     legacy = {"residual_max", "primitives", "init_primitive", "init_primitive_logit",
               "kappa_init", "kappa_min", "price_log_range"}.intersection(model_cfg)
     legacy_weights = any(any(part in key for part in ("res_head", "prim_head", "kappa_head"))
@@ -80,9 +85,25 @@ def _training_contract(values):
                          "theta_pg_sigma_gamma": values.get("theta_pg_sigma_gamma", 0.3),
                          "theta_pg_sigma_eta": values.get("theta_pg_sigma_eta", 0.3),
                          "theta_pg_antithetic": values.get("theta_pg_antithetic", True)})
+    elif signal == "theta_maxk":
+        contract.update({"theta_pg_antithetic": values.get("theta_pg_antithetic", True),
+                         "training_include_center": False, "validation_k": 16,
+                         "validation_include_center": True,
+                         "val_noise_seed": values.get("val_noise_seed", 20261106)})
     else:
         contract["entropy_coef"] = values.get("entropy_coef", 0.01)
     return contract
+
+
+def leave_one_out_max_advantage(rewards):
+    """max(R) - max(R excluding k); only a unique winner has positive advantage."""
+    if rewards.ndim != 2 or rewards.shape[1] < 2:
+        raise ValueError("Leave-one-out max advantages need rewards shaped (B,K), K>=2")
+    if not bool(torch.isfinite(rewards).all()):
+        raise ValueError("Leave-one-out max rewards must be finite")
+    top = rewards.topk(2, dim=1).values
+    gap = top[:, 0] - top[:, 1]
+    return (rewards == top[:, :1]).to(rewards.dtype) * gap[:, None]
 
 
 def set_seed(seed: int):
@@ -118,8 +139,17 @@ class MKPTrainer:
     def __init__(self, cfg: Config, device: torch.device):
         self.cfg, self.device = cfg, device
         tc = cfg.train
-        if tc.signal not in ("item_pg", "theta_pg"):
-            raise ValueError("train.signal must be item_pg or theta_pg")
+        if tc.signal not in ("item_pg", "theta_pg", "theta_maxk"):
+            raise ValueError("train.signal must be item_pg, theta_pg or theta_maxk")
+        if tc.signal == "theta_maxk":
+            if tc.theta_pg_antithetic:
+                raise ValueError("theta_maxk requires antithetic=False: its leave-one-out baseline needs independent proposals")
+            if cfg.model.theta_update != "static" or not cfg.model.theta_sigma_head:
+                raise ValueError("theta_maxk requires a static controller and theta_sigma_head=True")
+            if cfg.model.theta_groups != ["price", "alpha"] or cfg.model.price_anchor != "root":
+                raise ValueError("T4-b max@K uses the F0 price/alpha root executor")
+            if isinstance(tc.val_noise_seed, bool) or not isinstance(tc.val_noise_seed, int) or tc.val_noise_seed < 0:
+                raise ValueError("train.val_noise_seed must be a nonnegative integer")
         if tc.signal == "theta_pg":
             for name in ("theta_pg_sigma_u", "theta_pg_sigma_alpha", "theta_pg_sigma_gamma", "theta_pg_sigma_eta"):
                 if not math.isfinite(getattr(tc, name)) or getattr(tc, name) <= 0:
@@ -135,6 +165,11 @@ class MKPTrainer:
         self.selection_rule = ("minimum mean single-trajectory greedy gap (%) on fixed generated "
                                f"validation instances to {tc.validation_reference} reference; "
                                "benchmark data excluded; ties retain the earlier checkpoint")
+        if tc.signal == "theta_maxk":
+            self.selection_rule = ("minimum mean best-of-16 static theta-proposal gap (%) on fixed generated "
+                                   f"validation instances to {tc.validation_reference} reference; includes one "
+                                   "mean-theta greedy center and 15 independent proposals, fixed val_noise_seed="
+                                   f"{tc.val_noise_seed}; benchmark data excluded; ties retain the earlier checkpoint")
         self.source = source_provenance()
         self.run_name = tc.run_name or datetime.now().strftime("%Y%m%d_%H%M%S")
         self.run_dir = resolve_path(os.path.join(tc.runs_dir, self.run_name))
@@ -210,6 +245,9 @@ class MKPTrainer:
                 manifest = {"name": f"N{n}_M{m}", "data_sha256": instance_sha(generated),
                             "seed": tc.val_seed, "count": inst.B,
                             "reference": tc.validation_reference}
+                if tc.signal == "theta_maxk":
+                    manifest["decoding"] = {"stage": "theta16", "samples": 16, "include_center": True,
+                                             "noise_seed": tc.val_noise_seed + len(self.val_sets)}
                 if tc.validation_reference == "milp":
                     reference = milp_reference(generated, tc.val_milp_time_limit, tc.val_mip_rel_gap,
                                                tc.reference_cache, log=self.log)
@@ -316,7 +354,7 @@ class MKPTrainer:
             old_train = ck["config"]["train"]
             if _training_contract(old_train) != _training_contract(vars(self.cfg.train)):
                 raise ValueError("Resume cannot change the training contract (signal, sample count, "
-                                 "advantage normalization, sigma/antithetic or item entropy); "
+                                 "advantage normalization, sigma/antithetic, validation noise or item entropy); "
                                  "use train.init_from for a separate experiment")
             selection_fields = ("validation_reference", "val_seed", "val_instances", "val_sizes", "val_dims",
                                 "val_milp_time_limit", "val_mip_rel_gap")
@@ -365,36 +403,46 @@ class MKPTrainer:
                "entropy": 0.0, "u_abs_mean": 0.0, "alpha_mean": 0.0, "temperature": 0.0,
                "alpha_lower_frac": 0.0, "alpha_upper_frac": 0.0, "u_boundary_frac": 0.0, "raw_score_std": 0.0}
         theta_pg = tc.signal == "theta_pg"
+        maxk = tc.signal == "theta_maxk"
+        theta_based = theta_pg or maxk
         if "block" in self.cfg.model.theta_groups:
             agg["gamma_mean"] = 0.0
         if "lp" in self.cfg.model.theta_groups:
             agg["eta_mean"] = 0.0
         if theta_pg:
             agg.update({"R_mean": 0.0, "frac_better": 0.0, "adv_zero_frac": 0.0})
+        if maxk:
+            agg.update({"R_maxK": 0.0, "R_center": 0.0, "frac_adv_nonzero": 0.0,
+                        "proposal_u_abs_mean": 0.0, "sigma_u_mean": 0.0, "sigma_alpha_mean": 0.0,
+                        "sigma_u_min": float("inf"), "sigma_alpha_min": float("inf"),
+                        "sigma_u_max": -float("inf"), "sigma_alpha_max": -float("inf")})
         noise = ({"sigma_u": tc.theta_pg_sigma_u, "sigma_alpha": tc.theta_pg_sigma_alpha,
                   "sigma_gamma": tc.theta_pg_sigma_gamma, "sigma_eta": tc.theta_pg_sigma_eta,
                   "antithetic": tc.theta_pg_antithetic}
-                 if theta_pg else None)
+                 if theta_based else None)
+        if maxk:
+            noise["include_center"] = False  # All K training proposals are independent draws.
         for s in range(0, B, per_chunk):
             e = min(B, s + per_chunk)
             sub = MKPInstances(inst.p[s:e], inst.r[s:e], inst.c[s:e])
-            kwargs = {"theta_noise": noise} if theta_pg else {}
-            out = self.model(self.env, sub, num_samples=K, decode="greedy" if theta_pg else "sample",
+            kwargs = {"theta_noise": noise} if theta_based else {}
+            out = self.model(self.env, sub, num_samples=K, decode="greedy" if theta_based else "sample",
                              amp=self.amp, pre=(mu[s:e], ub[s:e]), **kwargs)
             R = out["reward"].view(e - s, K)
-            adv = R - R.mean(1, keepdim=True)
+            adv = leave_one_out_max_advantage(R) if maxk else R - R.mean(1, keepdim=True)
+            nonzero_fraction = (adv != 0).float().mean() if maxk else None
             if tc.adv_normalize:
                 adv = adv / (adv.std() + 1e-8)
-            ll = out["theta_logp" if theta_pg else "log_likelihood"].view(e - s, K)
+            ll = out["theta_logp" if theta_based else "log_likelihood"].view(e - s, K)
             loss = -(adv.detach() * ll).mean()
-            if not theta_pg:
+            if not theta_based:
                 loss = loss - tc.entropy_coef * out["entropy"].mean()
             if not torch.isfinite(loss):
                 raise FloatingPointError(f"Non-finite REINFORCE loss at step {self.global_step}")
             frac = (e - s) / B
             (loss * frac).backward()
             with torch.no_grad():
-                if theta_pg:
+                if theta_based:
                     # Diagnostics use the current deterministic mean policy, and
                     # never contribute to the score-function loss or its baseline.
                     was_training = self.model.training
@@ -405,9 +453,20 @@ class MKPTrainer:
                     finally:
                         self.model.train(was_training)
                     mean_reward = mean_out["reward"].view(e - s)
-                    agg["R_mean"] += mean_reward.mean().item() * frac
-                    agg["frac_better"] += (R > mean_reward[:, None]).float().mean().item() * frac
-                    agg["adv_zero_frac"] += (R.max(1).values == R.min(1).values).float().mean().item() * frac
+                    if theta_pg:
+                        agg["R_mean"] += mean_reward.mean().item() * frac
+                        agg["frac_better"] += (R > mean_reward[:, None]).float().mean().item() * frac
+                        agg["adv_zero_frac"] += (R.max(1).values == R.min(1).values).float().mean().item() * frac
+                    else:
+                        agg["R_maxK"] += R.max(1).values.mean().item() * frac
+                        agg["R_center"] += mean_reward.mean().item() * frac
+                        agg["frac_adv_nonzero"] += nonzero_fraction.item() * frac
+                        for key in ("sigma_u_mean", "sigma_alpha_mean", "proposal_u_abs_mean"):
+                            agg[key] += float(out[key]) * frac
+                        for key in ("sigma_u_min", "sigma_alpha_min"):
+                            agg[key] = min(agg[key], float(out[key]))
+                        for key in ("sigma_u_max", "sigma_alpha_max"):
+                            agg[key] = max(agg[key], float(out[key]))
                 profit = out["profit"].view(e - s, K)
                 ubv = out["ub"].view(e - s, K)
                 agg["loss"] += loss.item() * frac
@@ -441,9 +500,17 @@ class MKPTrainer:
         self.model.eval()
         res = {}
         gaps = []
-        for v in self.val_sets:
-            out = self.model(self.env, v["inst"], num_samples=1, decode="greedy", amp=self.amp, pre=v["pre"])
-            gap = float(((1 - out["profit"] / v["reference"]) * 100).mean())
+        for index, v in enumerate(self.val_sets):
+            if self.cfg.train.signal == "theta_maxk":
+                generator = torch.Generator(device="cpu").manual_seed(self.cfg.train.val_noise_seed + index)
+                out = self.model(self.env, v["inst"], num_samples=16, decode="greedy", amp=self.amp,
+                                 pre=v["pre"], theta_noise={"antithetic": False, "include_center": True,
+                                                            "generator": generator})
+                profit = out["profit"].view(v["inst"].B, 16).max(1).values
+            else:
+                out = self.model(self.env, v["inst"], num_samples=1, decode="greedy", amp=self.amp, pre=v["pre"])
+                profit = out["profit"]
+            gap = float(((1 - profit / v["reference"]) * 100).mean())
             res[f"gap_{v['name']}"] = gap
             res[f"rej_{v['name']}"] = float(out["n_reject"].mean())
             gaps.append(gap)
@@ -452,6 +519,11 @@ class MKPTrainer:
 
     def fit(self):
         tc = self.cfg.train
+        epoch_diagnostics = (("R_maxK", "R_center", "frac_adv_nonzero", "sigma_u_mean", "sigma_u_min",
+                              "sigma_u_max", "sigma_alpha_mean", "sigma_alpha_min", "sigma_alpha_max",
+                              "proposal_u_abs_mean") if tc.signal == "theta_maxk" else
+                             ("R_mean", "frac_better", "adv_zero_frac"))
+        validation_label = "theta16 with mean center" if tc.signal == "theta_maxk" else "greedy"
         if tc.gate_early_stop and tc.val_every != 1:
             raise ValueError("Gate early stopping requires validation every epoch")
         if tc.gate_early_stop and not tc.resume and not tc.initial_validation:
@@ -464,7 +536,7 @@ class MKPTrainer:
             self.log(f"epoch -1 initialization validation: {val}")
             self.save(True)
             self.epoch_csv.log({"epoch": -1, "step": 0, "signal": tc.signal,
-                                "R_mean": "", "frac_better": "", "adv_zero_frac": "",
+                                **{key: "" for key in epoch_diagnostics},
                                 "time_s": time.time() - initial_started,
                                 "val_gap": val["gap_mean"], "best_val": self.best_val})
         if tc.gate_early_stop and self.initial_gap is None:
@@ -478,7 +550,12 @@ class MKPTrainer:
                 st = self.train_step()
                 for k, val in st.items():
                     if isinstance(val, (int, float)):
-                        run[k] = run.get(k, 0.0) + val
+                        if k.startswith("sigma_") and k.endswith("_min"):
+                            run[k] = min(run.get(k, float("inf")), val)
+                        elif k.startswith("sigma_") and k.endswith("_max"):
+                            run[k] = max(run.get(k, -float("inf")), val)
+                        else:
+                            run[k] = run.get(k, 0.0) + val
                 row = {"epoch": ep, "step": self.global_step, **st}
                 self.train_csv.log(row)
                 if self.tb is not None:
@@ -497,6 +574,12 @@ class MKPTrainer:
                     if tc.signal == "theta_pg":
                         msg += (f" | R_mean {st['R_mean']:.4f} | frac_better {st['frac_better']:.3f} "
                                 f"| adv_zero_frac {st['adv_zero_frac']:.3f}")
+                    elif tc.signal == "theta_maxk":
+                        msg += (f" | R_maxK {st['R_maxK']:.4f} | R_center {st['R_center']:.4f} "
+                                f"| frac_adv_nonzero {st['frac_adv_nonzero']:.3f} "
+                                f"| sigma_u {st['sigma_u_mean']:.4f}[{st['sigma_u_min']:.4f},{st['sigma_u_max']:.4f}] "
+                                f"| sigma_alpha {st['sigma_alpha_mean']:.4f}[{st['sigma_alpha_min']:.4f},{st['sigma_alpha_max']:.4f}] "
+                                f"| mean_head_abs_u {st['proposal_u_abs_mean']:.4f}")
                     if "eta_mean" in st:
                         msg += f" | eta {st['eta_mean']:.3f}"
                     self.log(msg)
@@ -512,7 +595,7 @@ class MKPTrainer:
                 if self.tb is not None:
                     for k, x in val.items():
                         self.tb.add_scalar(f"val/{k}", x, self.global_step)
-                self.log(f"== epoch {ep} synthetic validation (greedy, gap to {tc.validation_reference} reference): " +
+                self.log(f"== epoch {ep} synthetic validation ({validation_label}, gap to {tc.validation_reference} reference): " +
                          ", ".join(f"{k}={x:.4f}" for k, x in val.items()) +
                          f" | best {self.best_val:.4f}{' *' if is_best else ''} | epoch time {time.time() - t0:.0f}s")
             self.epoch = ep + 1
@@ -520,8 +603,9 @@ class MKPTrainer:
                 self.gate_gaps.append(val["gap_mean"])
             self.save(is_best)
             self.epoch_csv.log({"epoch": ep, "step": self.global_step, "signal": tc.signal,
-                                **{key: run[key] / tc.steps_per_epoch if key in run else ""
-                                   for key in ("R_mean", "frac_better", "adv_zero_frac")},
+                                **{key: (run[key] if key.startswith("sigma_") and key.endswith(("_min", "_max"))
+                                         else run[key] / tc.steps_per_epoch) if key in run else ""
+                                   for key in epoch_diagnostics},
                                 "time_s": time.time() - t0, "val_gap": epoch_val,
                                 "best_val": self.best_val})
             if tc.gate_early_stop and ep == 3 and self.initial_gap is not None and len(self.gate_gaps) == 4 and all(g > self.initial_gap + tc.gate_margin_pp for g in self.gate_gaps):

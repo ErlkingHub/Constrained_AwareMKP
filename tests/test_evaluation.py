@@ -95,12 +95,25 @@ class EvaluationTests(unittest.TestCase):
         def loaded(path, *args, **kwargs):
             mc = static if path.endswith("static.pt") else cfg
             return object(), mc, {"config": mc.to_dict()}
-        with patch("Benchmark_zeroShot.load_policy", side_effect=loaded), \
+        with patch("Benchmark_zeroShot.load_policy", side_effect=loaded) as loader, \
                 patch("Benchmark_zeroShot.sha256_file", return_value="hash"):
             for arms in (["learned_static", "learned_dynamic", "untrained"],
                          ["learned_dynamic", "learned_static", "untrained"]):
                 _, configs, _, _ = _load_arms(cfg, arms, "dynamic.pt", "static.pt", torch.device("cpu"))
                 self.assertEqual(configs["untrained"].model.theta_update, "step")
+            # A fixed-only T4-b evaluation must still inherit its registered
+            # proposal from --static_checkpoint, even without a learned arm.
+            static.model.theta_sigma_head = True
+            static.model.theta_sigma_dims = "a"
+            static.model.theta_sigma_u0 = .1
+            static.model.theta_sigma_alpha0 = .6
+            loader.reset_mock()
+            _, configs, checkpoints, _ = _load_arms(cfg, ["fixed"], None, "static.pt", torch.device("cpu"))
+            self.assertEqual(loader.call_count, 1)
+            self.assertTrue(checkpoints["reference"]["path"].endswith("static.pt"))
+            self.assertTrue(configs["fixed"].model.theta_sigma_head)
+            self.assertEqual(configs["fixed"].model.theta_sigma_dims, "a")
+            self.assertEqual(configs["fixed"].model.theta_sigma_alpha0, .6)
 
     def test_fixed_stage_reproducibility_and_exact_sample_count(self):
         torch.set_num_threads(2)
