@@ -1,5 +1,7 @@
 # Constrained_AwareMKP
 
+> 2026-11-07 T5: [Read-only v6 attribution and user run commands](docs/WEAK_DECODER_T5_EXECUTION.md). T4-b is not trained after the T4 gate. T5 isolates the old project in a separate process and compares dynamic, default and constant theta without training.
+
 > 2026-11-06 T4: [SMS and max@K implementation, protocols and user run commands](docs/WEAK_DECODER_T4_EXECUTION.md). T4-a compares strategy-space starts with item sampling; T4-b only prepares configuration until explicitly started. Full experiments are user-run; LP/block remain off.
 
 > 2026-11-05 T3: [Residual-LP basis scan and gated training handoff](docs/WEAK_DECODER_T3_EXECUTION.md). T3-a scans fixed greedy executors; T3-b is prepared for user-run training only after the research gate. Default G0/G1 behavior is retained.
