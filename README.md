@@ -1,5 +1,7 @@
 # Constrained_AwareMKP
 
+> 2026-11-08 T7: [Value location, selection stability and sampled interface capacity](docs/WEAK_DECODER_T7_EXECUTION.md). Single greedy switching/interval policies and separately labeled state/oracle diagnostics; no training, multi-start or ILS. Proven-optimum and incumbent targets are reported separately.
+
 > 2026-11-07 T6: [Single-trajectory phase schedules and user run commands](docs/WEAK_DECODER_T6_EXECUTION.md). Reuse T5 references, fit deployable clocks on synthetic traces, and evaluate S1–S5 without training. SMS/sampleK/ILS are frozen reference stages.
 
 > 2026-11-07 T5: [Read-only v6 attribution and user run commands](docs/WEAK_DECODER_T5_EXECUTION.md). T4-b is not trained after the T4 gate. T5 isolates the old project in a separate process and compares dynamic, default and constant theta without training.
