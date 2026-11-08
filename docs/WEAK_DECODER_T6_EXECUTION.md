@@ -6,13 +6,13 @@
 
 从 T5 的 `b3c16ef` 创建 `codex/t6-phase-schedule`。指导文档独立提交为 `324d1c2`，代码为 `3f6fedc`；本执行报告另作 docs 提交，编号见分支日志。
 
-| 文件 | 修改 |
-|---|---|
-| `scripts/t6_schedule.py` | 三种可部署时钟、分位数节点拟合、分段线性插值、S1–S5 actor、完整实例二折诊断 |
-| `scripts/run_t6_phase.py` | 复用 T5 数据/基准、重新采集拟合迹、单轨迹评估、逐实例落盘与旧项目只读审计 |
-| `scripts/t6_report.py` | 双参照配对表、回收率与 M×N 分层、时钟/分组/价格对照、R² 和报告校验记录 |
-| `tests/test_t6_phase.py` | 指导要求的两项测试，旧模块只进入独立子进程 |
-| `README.md`、本报告 | 当前入口、验证范围和用户运行命令 |
+| 文件                      | 修改                                                                        |
+| ------------------------- | --------------------------------------------------------------------------- |
+| `scripts/t6_schedule.py`  | 三种可部署时钟、分位数节点拟合、分段线性插值、S1–S5 actor、完整实例二折诊断 |
+| `scripts/run_t6_phase.py` | 复用 T5 数据/基准、重新采集拟合迹、单轨迹评估、逐实例落盘与旧项目只读审计   |
+| `scripts/t6_report.py`    | 双参照配对表、回收率与 M×N 分层、时钟/分组/价格对照、R² 和报告校验记录      |
+| `tests/test_t6_phase.py`  | 指导要求的两项测试，旧模块只进入独立子进程                                  |
+| `README.md`、本报告       | 当前入口、验证范围和用户运行命令                                            |
 
 新项目的模型、训练器、解码器和 T5 实现均不修改。所有新推理为 `stochastic=False`，每例每臂一条 greedy 轨迹；没有 `--train`、采样数或搜索参数。`results/`、`runs/`、`checkpoints/`、`cache/` 不入 git，不使用 `git add -f`。
 
@@ -46,13 +46,13 @@
 
 ### 3.2 五个臂
 
-| 臂 | 分组 | 时钟 | 字段 |
-|---|---|---|---|
-| S1 | M,N,名义容量比 | tau_step | 所有标量 + companion，价格均匀 |
-| S2 | 同上 | tau_cap | 同上 |
-| S3 | 只按 M | tau_cap | 同上，interactions 也按 M 取常数 |
-| S4 | M,N,名义容量比 | tau_cap | 仅 profit_exponent/scarcity/lp_primal/companion；其余保留 T5 C，价格改为均匀 |
-| S5 | M,N,名义容量比 | tau_cap | 同 S2，价格替换为实时 L 控制器的价格通道 |
+| 臂  | 分组           | 时钟     | 字段                                                                         |
+| --- | -------------- | -------- | ---------------------------------------------------------------------------- |
+| S1  | M,N,名义容量比 | tau_step | 所有标量 + companion，价格均匀                                               |
+| S2  | 同上           | tau_cap  | 同上                                                                         |
+| S3  | 只按 M         | tau_cap  | 同上，interactions 也按 M 取常数                                             |
+| S4  | M,N,名义容量比 | tau_cap  | 仅 profit_exponent/scarcity/lp_primal/companion；其余保留 T5 C，价格改为均匀 |
+| S5  | M,N,名义容量比 | tau_cap  | 同 S2，价格替换为实时 L 控制器的价格通道                                     |
 
 三种时钟、两种分组都生成表和交叉拟合诊断；tau_feas 只做指定的模型诊断，不增加新的评估臂。旧 decoder、LP、可行性、终止条件和 greedy tie-break 均不改变。
 
