@@ -3,3 +3,4 @@ numpy
 scipy
 tqdm
 tensorboard  # optional, training curves
+matplotlib  # T8 measured training curves

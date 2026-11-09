@@ -57,6 +57,10 @@ def _check_checkpoint(ck, expected_model=None):
     model_cfg.setdefault("theta_sigma_u0", 0.05)
     model_cfg.setdefault("theta_sigma_alpha0", 0.3)
     model_cfg.setdefault("theta_sigma_dims", "ua")
+    model_cfg.setdefault("executor", "g0g1")
+    model_cfg.setdefault("theta_family", "g0g1")
+    model_cfg.setdefault("ctrl_residual_lp_features", False)
+    model_cfg.setdefault("v6_critic", False)
     legacy = {"residual_max", "primitives", "init_primitive", "init_primitive_logit",
               "kappa_init", "kappa_min", "price_log_range"}.intersection(model_cfg)
     legacy_weights = any(any(part in key for part in ("res_head", "prim_head", "kappa_head"))
@@ -137,6 +141,8 @@ class _CSVLogger:
 
 class MKPTrainer:
     def __init__(self, cfg: Config, device: torch.device):
+        if cfg.model.executor == "v6":
+            raise ValueError("Use the T8 trainer/launcher for the v6 executor")
         self.cfg, self.device = cfg, device
         tc = cfg.train
         if tc.signal not in ("item_pg", "theta_pg", "theta_maxk"):

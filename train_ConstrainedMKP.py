@@ -24,7 +24,11 @@ def main(argv=None):
         return
     set_seed(cfg.device.seed)
     device = get_device(cfg)          # cuda:1 by default (see mkp_config.DeviceConfig)
-    MKPTrainer(cfg, device).fit()
+    if cfg.model.executor == "v6":
+        from mkp_t8_train import T8Trainer
+        T8Trainer(cfg, device).fit()
+    else:
+        MKPTrainer(cfg, device).fit()
 
 
 if __name__ == "__main__":

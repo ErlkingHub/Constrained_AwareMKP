@@ -97,6 +97,8 @@ def _historical_rollout(env, inst, pre, k, decode, temperature):
 def evaluate_stage(model, env, inst, ec, device, amp, pre, stage, arm, seed, instance_id,
                    root_lp_seconds=0.0, artifact_sink=None, return_candidates=False,
                    centered_samples=False, sms_tag=0):
+    if getattr(model.mcfg,"executor","g0g1") == "v6":
+        raise ValueError("Use scripts/eval_t8.py for T8 v6 single-greedy evaluation")
     spec = parse_stages([stage], ec.num_samples)[0]
     rng_seed = paired_seed(seed, instance_id, stage)
     set_seed(rng_seed)

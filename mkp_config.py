@@ -82,6 +82,10 @@ class EnvConfig:
 # --------------------------------------------------------------------------------------
 @dataclass
 class ModelConfig:
+    executor: str = "g0g1"             # g0g1 | v6; legacy path unchanged
+    theta_family: str = "g0g1"         # g0g1 | v6
+    ctrl_residual_lp_features: bool = False
+    v6_critic: bool = False             # independent critic/feasibility head, T8-B only
     embed_dim: int = 128
     num_heads: int = 8
     ff_mult: int = 4
@@ -123,7 +127,7 @@ class ModelConfig:
 # --------------------------------------------------------------------------------------
 @dataclass
 class TrainConfig:
-    signal: str = "theta_pg"             # theta_pg | theta_maxk | item_pg (legacy)
+    signal: str = "theta_pg"             # theta_pg | theta_maxk | item_pg | ppo_gae
     theta_pg_sigma_u: float = 0.05
     theta_pg_sigma_alpha: float = 0.3
     theta_pg_sigma_gamma: float = 0.3
@@ -163,6 +167,25 @@ class TrainConfig:
     resume: str = ""                      # path to a checkpoint to resume from ("" = scratch)
     init_from: str = ""                   # load weights only (fine-tune), "" = none
     run_name: str = ""                    # default: timestamp
+    ppo_epochs: int = 3
+    minibatch_size: int = 128
+    clip_ratio: float = 0.2
+    target_kl: float = 0.03
+    gae_lambda: float = 0.95
+    value_coefficient: float = 0.5
+    value_clip: float = 0.2
+    constraint_aux_coefficient: float = 0.05
+    ranking_coefficient: float = 0.1
+    ranking_states: int = 16
+    ranking_pool_size: int = 64
+    ranking_candidates: int = 8
+    ranking_repeats: int = 4
+    ranking_minibatch_size: int = 8
+    ranking_min_gap: float = 0.001
+    ranking_se_multiplier: float = 1.0
+    ranking_return_scale: float = 0.02
+    ranking_score_scale: float = 0.2
+    ranking_greedy_weight: float = 0.5
 
 
 # --------------------------------------------------------------------------------------

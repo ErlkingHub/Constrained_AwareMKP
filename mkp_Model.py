@@ -136,9 +136,10 @@ class StateEncoder(nn.Module):
             DualAxisBlock(d, cfg.num_heads, cfg.ff_mult, cfg.dropout, F_EDGE_STATIC, cfg.edge_hidden)
             for _ in range(cfg.encoder_layers)])
         self.ln_x, self.ln_y = nn.LayerNorm(d), nn.LayerNorm(d)
-        self.dyn_item = nn.Sequential(nn.Linear(F_ITEM_DYN, d), nn.GELU(), nn.Linear(d, d))
-        self.dyn_res = nn.Sequential(nn.Linear(F_RES_DYN, d), nn.GELU(), nn.Linear(d, d))
-        self.dyn_glob = nn.Sequential(nn.Linear(F_GLOBAL, d), nn.GELU(), nn.Linear(d, d))
+        lp = cfg.executor == "v6" and cfg.ctrl_residual_lp_features
+        self.dyn_item = nn.Sequential(nn.Linear(F_ITEM_DYN + 4*lp, d), nn.GELU(), nn.Linear(d, d))
+        self.dyn_res = nn.Sequential(nn.Linear(F_RES_DYN + 3*lp, d), nn.GELU(), nn.Linear(d, d))
+        self.dyn_glob = nn.Sequential(nn.Linear(F_GLOBAL + 2*lp, d), nn.GELU(), nn.Linear(d, d))
 
     def encode_static(self, item_s, res_s, edge_s):
         x, y = self.item_in(item_s), self.res_in(res_s)
@@ -253,6 +254,12 @@ class StrategyController(nn.Module):
         self.ln_x, self.ln_y = nn.LayerNorm(d), nn.LayerNorm(d)
         self.ctx = nn.Sequential(nn.Linear(4 * d, d), nn.GELU(), nn.Linear(d, d))
         self.price_head = nn.Sequential(nn.Linear(2 * d, d), nn.GELU(), nn.Linear(d, 1))
+        if cfg.theta_family == "v6":
+            from mkp_v6_model import V6Heads
+            self.v6_heads = V6Heads(cfg)
+            nn.init.zeros_(self.price_head[-1].weight)
+            nn.init.zeros_(self.price_head[-1].bias)
+            return
         if cfg.theta_sigma_head:
             if set(groups) != {"price", "alpha"}:
                 raise ValueError("SMS proposal heads require the F0 price/alpha interface")
@@ -285,7 +292,7 @@ class StrategyController(nn.Module):
                         initial = self.cfg.block_gamma_init if name == "block" else self.cfg.lp_eta_init
                         self.scalar_head.bias[index] = math.log(math.expm1(initial))
 
-    def forward(self, x, y, g, edge, avail):
+    def representation(self, x, y, g, edge, avail):
         done = ~avail.any(1)
         keep = avail | done[:, None]                          # avoid fully-masked rows
         for blk in self.blocks:
@@ -296,8 +303,17 @@ class StrategyController(nn.Module):
         x_mean = (x * w).sum(1) / cnt
         x_max = x.masked_fill(~keep[:, :, None], -1e4).max(1).values
         ctx = self.ctx(torch.cat([x_mean, x_max, y.mean(1), g], dim=-1))       # (B,d)
+        return x,y,ctx
+
+    def forward(self, x, y, g, edge, avail):
+        x,y,ctx = self.representation(x,y,g,edge,avail)
         cfg = self.cfg
         M = y.shape[1]
+        if cfg.theta_family == "v6":
+            with torch.autocast(device_type=y.device.type, enabled=False):
+                features = torch.cat([y.float(),ctx.float()[:,None].expand(-1,M,-1)],-1)
+                logits = self.price_head(features).squeeze(-1)
+                return self.v6_heads(logits,y.float(),ctx.float())
         v = self.price_head(torch.cat([y, ctx[:, None, :].expand(-1, M, -1)], -1)).squeeze(-1).float()
         if cfg.theta_sigma_head:
             # New proposal heads keep their registered zero-init center exact
@@ -396,6 +412,12 @@ class ConstrainedMKPPolicy(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.mcfg, self.ecfg = cfg.model, cfg.env
+        if cfg.model.executor == "v6":
+            from mkp_v6_model import V6Policy
+            self.v6_engine = V6Policy(cfg)
+            return
+        if cfg.model.executor != "g0g1" or cfg.model.theta_family != "g0g1":
+            raise ValueError("executor/theta_family must both select g0g1 or v6")
         if cfg.model.price_anchor not in ("root", "residual") or cfg.model.lp_source not in ("root", "residual"):
             raise ValueError("price_anchor and lp_source must be root or residual")
         if isinstance(cfg.model.lp_interval, bool) or not isinstance(cfg.model.lp_interval, int) or cfg.model.lp_interval < 1:
@@ -472,7 +494,21 @@ class ConstrainedMKPPolicy(nn.Module):
             out["sigma_alpha"] = torch.full_like(out["alpha_pre"], self.mcfg.theta_sigma_alpha0 if "a" in self.mcfg.theta_sigma_dims else 0.)
         return {k:out[k] for k in ("u_pre","alpha_pre","sigma_u","sigma_alpha")}
 
-    def forward(self, env: MKPEnv, inst: MKPInstances, num_samples: int = 1,
+    def policy(self,state):
+        return self.v6_engine.policy(state)
+
+    def value(self,state):
+        return self.v6_engine.value(state)
+
+    @property
+    def feature_config(self):
+        return self.v6_engine.exec_cfg
+
+    @property
+    def reuse_state_features(self):
+        return False
+
+    def forward(self, env: MKPEnv, inst: MKPInstances = None, num_samples: int = 1,
                 decode: str = "sample", temperature: float = 1.0, amp: bool = False,
                 pre: Optional[tuple] = None, return_trace: bool = False,
                 theta_override=None, theta_noise: Optional[dict] = None, sigma_override=None):
@@ -484,6 +520,12 @@ class ConstrainedMKPPolicy(nn.Module):
         theta_noise samples detached latent actions for a Gaussian score function;
         item choices are always greedy. Step controls refresh every theta_interval.
         """
+        if self.mcfg.executor == "v6":
+            if inst is None:
+                return self.v6_engine.step_forward(env)
+            if theta_noise is not None or sigma_override is not None:
+                raise ValueError("T8 supports item-PG/PPO only, no theta-noise/SMS stages")
+            return self.v6_engine.episode(inst,num_samples,decode,theta_override,return_trace)
         if theta_noise is not None:
             if theta_override is not None or self.decoder.mode != "hard_mask" or "alpha" not in self.mcfg.theta_groups:
                 raise ValueError("Theta noise requires learned price/alpha controls and hard_mask")
