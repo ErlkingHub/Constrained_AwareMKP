@@ -1,5 +1,7 @@
 # Constrained_AwareMKP
 
+> 2026-11-09 T8: [E_full executor port, dual training signals and user run commands](docs/WEAK_DECODER_T8_EXECUTION.md). New dual-axis controller with v6 heads; item-PG and PPO/GAE arms share a joint-M protocol. Local equivalence checks pass; formal training and single-greedy evaluation are user-run. Default G0+G1 remains unchanged.
+
 > 2026-11-08 T7: [Value location, selection stability and sampled interface capacity](docs/WEAK_DECODER_T7_EXECUTION.md). Single greedy switching/interval policies and separately labeled state/oracle diagnostics; no training, multi-start or ILS. Proven-optimum and incumbent targets are reported separately.
 
 > 2026-11-07 T6: [Single-trajectory phase schedules and user run commands](docs/WEAK_DECODER_T6_EXECUTION.md). Reuse T5 references, fit deployable clocks on synthetic traces, and evaluate S1–S5 without training. SMS/sampleK/ILS are frozen reference stages.
