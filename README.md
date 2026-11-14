@@ -1,5 +1,9 @@
 # Constrained_AwareMKP
 
+> 2026-11-14 T9: [Compact cert theta, LP certificates, gates and runtime estimate](docs/WEAK_DECODER_T9_EXECUTION.md). New training is cert-only; no v6/v6c retraining. All headline arms use Chu270. Formal gates precede training; preliminary timing projects about 34–42 hours with the unchanged T8-A budget rule. No training-speed optimization applied.
+
+> 2026-11-13: [Chu270 evaluation and reuse of existing Chu180 baselines](docs/WEAK_DECODER_T8_EXECUTION.md). D/A/B cover M5/M10/M30; G/L comparisons retain their matched historical subset. Training and validation remain M5/M10.
+
 > 2026-11-09 T8: [E_full executor port, dual training signals and user run commands](docs/WEAK_DECODER_T8_EXECUTION.md). New dual-axis controller with v6 heads; item-PG and PPO/GAE arms share a joint-M protocol. Local equivalence checks pass; formal training and single-greedy evaluation are user-run. Default G0+G1 remains unchanged.
 
 > 2026-11-08 T7: [Value location, selection stability and sampled interface capacity](docs/WEAK_DECODER_T7_EXECUTION.md). Single greedy switching/interval policies and separately labeled state/oracle diagnostics; no training, multi-start or ILS. Proven-optimum and incumbent targets are reported separately.

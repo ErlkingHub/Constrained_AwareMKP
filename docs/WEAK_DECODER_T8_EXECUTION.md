@@ -4,6 +4,23 @@
 
 分支：`codex/t8-v6-executor-training-signals`。指导文档提交：`e24cbb8`，代码提交：`e20004f`。代码和本执行说明分开提交。
 
+## 0. 2026-11-13 补充：当前评估改为 Chu270
+
+按用户最新要求，`scripts/eval_t8.py` 现在加载完整 **M∈{5,10,30} × N∈{100,250,500}，九组各 30 例，共 270 例**。D_port、A、B 必须覆盖全部 270 例才算完成；M30 的 90 例作为跨约束数测试，直接使用原联合 M5/M10 模型，不改变训练/验证协议或要求重新训练。新建配置的通用 `EvalConfig.dims` 默认也包含 30。
+
+T5 的 G 常数 θ、L_v6 历史结果只覆盖 M5/M10。G_port 继续评估其有参数的 180 例，L_v6 继续引用原 180 例；没有伪造 M30 θ、补默认值或运行旧项目来补 L。A/B、A/B 对 D 的配对覆盖 270；A/B 对 G/L 的配对及回收率只在相同的 180 例上计算。`paired_coverage.csv` 列出各比较的分母与未配对数，`summary.csv` 显示每行的实际 M 范围和例数；M30 单独列出 gap、耗时、A/B 与 D 的比较，缺少历史对照的回收率留空。T5 的约 0.571/0.514% 和 0.005 pp 复现门槛仍只用于原 180 例共同子集，不能作为 Chu270 参考均值。
+
+**已有 `results/t8_port` 的完整 180 例基线可直接复用。** 新入口核对其 SHA、逐例身份与参考值，只补跑缺少的 90 条 M30 D 轨迹，然后运行 A/B 的完整 270 例；合成128仍保持原协议。现有结果和 checkpoint 不覆盖。已完成训练时直接执行：
+
+```powershell
+$py = 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe'
+& $py scripts/eval_t8.py --arms A B --device cuda:0 --port_reference results/t8_port --output results/t8_best_270
+```
+
+若从头生成基线，使用 `--output results/t8_port_270`，之后把 `--port_reference` 指向该目录。`--limit 2` 保留为工程检查开关：现在代表 Chu3（每种 M 一例）+合成2；G 只有其中 M5/M10 两例。它不代表正式270评估。
+
+本次修改的验证：5 项覆盖/迁移/配对测试和 31 项既有回归通过，含真实 M30 实例的单轨迹 greedy；另对现有 A/B checkpoint 做 Chu3+合成2 的入口检查。完整270评估仍由用户运行。下文第1–3节为最初实施时的工程记录，不代表后续训练或评估的最新进度。
+
 ## 1. 已实现的代码
 
 | 文件 | 核心修改 |
@@ -94,15 +111,15 @@ $py = 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe'
 # 仅生成配置，不训练
 & $py scripts/run_t8.py --cuda_device 0
 
-# 先确认移植：每臂 Chu180 + 合成128；仅 greedy
-& $py scripts/eval_t8.py --device cuda:0 --output results/t8_port
+# 新生成基线：D为Chu270，G为有T5参数的Chu180；各加合成128；仅greedy
+& $py scripts/eval_t8.py --device cuda:0 --output results/t8_port_270
 
 # 上一步 status=complete 且 reproduction.json 通过后，再分别启动两臂
 & $py scripts/run_t8.py --train A --cuda_device 0
 & $py scripts/run_t8.py --train B --cuda_device 0
 
-# best 正式比较；复用已经验证的 D/G，引用 T5 的 L
-& $py scripts/eval_t8.py --arms A B --device cuda:0 --port_reference results/t8_port --output results/t8_best
+# best 正式比较：A/B各Chu270；复用D/G并在共同子集引用T5的L
+& $py scripts/eval_t8.py --arms A B --device cuda:0 --port_reference results/t8_port_270 --output results/t8_best_270
 
 # 训练曲线
 & $py scripts/t8_report.py --runs runs/t8_a_jointM_s1234 runs/t8_b_jointM_s1234 --output results/t8_training_curves
@@ -111,7 +128,7 @@ $py = 'D:\Zlb08\.envs\RL_MKPtest\Scripts\python.exe'
 如需检查 last，单独输出，不能混进 best 表：
 
 ```powershell
-& $py scripts/eval_t8.py --arms A B --tag last --device cuda:0 --port_reference results/t8_port --a_checkpoint checkpoints/t8_a_jointM_s1234/last.pt --b_checkpoint checkpoints/t8_b_jointM_s1234/last.pt --output results/t8_last
+& $py scripts/eval_t8.py --arms A B --tag last --device cuda:0 --port_reference results/t8_port_270 --a_checkpoint checkpoints/t8_a_jointM_s1234/last.pt --b_checkpoint checkpoints/t8_b_jointM_s1234/last.pt --output results/t8_last_270
 ```
 
 必要测试与入口检查的独立命令：
