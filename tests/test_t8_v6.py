@@ -1,4 +1,4 @@
-"""The three T8 checks; full 180-case D/G reproduction remains user-run."""
+"""Original T8 numerical checks; T5 reproduction uses its Chu180 overlap."""
 import json
 import os
 from pathlib import Path

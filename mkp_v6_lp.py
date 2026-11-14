@@ -40,6 +40,11 @@ class LPRelaxation:
     dual_share: torch.Tensor  # [B,N,M] y_j w_ij / p_i, resource share of the dual cost
     bound: torch.Tensor       # [B] float64 upper bound on remaining profit, raw units
     feasible_mass: torch.Tensor  # [B] float64 feasible profit mass, raw units
+    dual_value: torch.Tensor     # unclamped dual certificate, float64 raw units
+    primal_value: torch.Tensor   # smoothed primal scaled down to feasibility
+    certificate_gap: torch.Tensor
+    scale: torch.Tensor         # mean feasible profit
+    raw_prices: torch.Tensor    # float64 multipliers per raw resource unit
 
 
 def lp_signature(config):
@@ -96,8 +101,14 @@ def solve_lp_relaxation(state, config):
     active = count > 0
     bound = torch.where(active, torch.minimum(bound, mass), torch.zeros_like(bound))
     share = loads * y[:, None] / profits.clamp_min(eps)[..., None] * mask[..., None]
+    # Diagnostics only: retain every original output and its operation order.
+    dual_value = (y.sum(-1) + (reduced.clamp_min(0) * mask).sum(-1)) * scale
+    factor = usage.amax(-1).clamp_min(1).reciprocal()
+    primal_value = (p * primal * factor[:, None]).sum(-1)
+    raw_prices = y * scale[:, None] / rem.clamp_min(eps)
     return LPRelaxation(primal.float(), (reduced * mask).float(), y.float(),
-                        (1 - usage).clamp(0, 1).float(), share.float(), bound, mass)
+                        (1 - usage).clamp(0, 1).float(), share.float(), bound, mass,
+                        dual_value, primal_value, (dual_value-primal_value).clamp_min(0), scale, raw_prices)
 
 
 def lp_relaxation(state, config):

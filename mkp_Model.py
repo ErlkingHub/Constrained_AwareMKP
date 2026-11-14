@@ -136,10 +136,11 @@ class StateEncoder(nn.Module):
             DualAxisBlock(d, cfg.num_heads, cfg.ff_mult, cfg.dropout, F_EDGE_STATIC, cfg.edge_hidden)
             for _ in range(cfg.encoder_layers)])
         self.ln_x, self.ln_y = nn.LayerNorm(d), nn.LayerNorm(d)
-        lp = cfg.executor == "v6" and cfg.ctrl_residual_lp_features
-        self.dyn_item = nn.Sequential(nn.Linear(F_ITEM_DYN + 4*lp, d), nn.GELU(), nn.Linear(d, d))
+        lp = cfg.executor in ("v6","cert") and cfg.ctrl_residual_lp_features
+        basis = cfg.ctrl_basis_features
+        self.dyn_item = nn.Sequential(nn.Linear(F_ITEM_DYN + 4*lp + 7*basis, d), nn.GELU(), nn.Linear(d, d))
         self.dyn_res = nn.Sequential(nn.Linear(F_RES_DYN + 3*lp, d), nn.GELU(), nn.Linear(d, d))
-        self.dyn_glob = nn.Sequential(nn.Linear(F_GLOBAL + 2*lp, d), nn.GELU(), nn.Linear(d, d))
+        self.dyn_glob = nn.Sequential(nn.Linear(F_GLOBAL + 2*lp + 3*basis, d), nn.GELU(), nn.Linear(d, d))
 
     def encode_static(self, item_s, res_s, edge_s):
         x, y = self.item_in(item_s), self.res_in(res_s)
@@ -253,6 +254,10 @@ class StrategyController(nn.Module):
             for _ in range(cfg.controller_layers)])
         self.ln_x, self.ln_y = nn.LayerNorm(d), nn.LayerNorm(d)
         self.ctx = nn.Sequential(nn.Linear(4 * d, d), nn.GELU(), nn.Linear(d, d))
+        if cfg.theta_family == "cert":
+            from mkp_cert_model import make_head
+            self.cert_head = make_head(cfg)
+            return
         self.price_head = nn.Sequential(nn.Linear(2 * d, d), nn.GELU(), nn.Linear(d, 1))
         if cfg.theta_family == "v6":
             from mkp_v6_model import V6Heads
@@ -309,6 +314,9 @@ class StrategyController(nn.Module):
         x,y,ctx = self.representation(x,y,g,edge,avail)
         cfg = self.cfg
         M = y.shape[1]
+        if cfg.theta_family == "cert":
+            from mkp_cert_model import read_head
+            return read_head(self.cert_head,ctx,cfg)
         if cfg.theta_family == "v6":
             with torch.autocast(device_type=y.device.type, enabled=False):
                 features = torch.cat([y.float(),ctx.float()[:,None].expand(-1,M,-1)],-1)
@@ -412,6 +420,10 @@ class ConstrainedMKPPolicy(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.mcfg, self.ecfg = cfg.model, cfg.env
+        if cfg.model.executor == "cert":
+            from mkp_cert_model import CertPolicy
+            self.cert_engine = CertPolicy(cfg)
+            return
         if cfg.model.executor == "v6":
             from mkp_v6_model import V6Policy
             self.v6_engine = V6Policy(cfg)
@@ -495,14 +507,18 @@ class ConstrainedMKPPolicy(nn.Module):
         return {k:out[k] for k in ("u_pre","alpha_pre","sigma_u","sigma_alpha")}
 
     def policy(self,state):
-        return self.v6_engine.policy(state)
+        return self.executor_engine.policy(state)
 
     def value(self,state):
-        return self.v6_engine.value(state)
+        return self.executor_engine.value(state)
+
+    @property
+    def executor_engine(self):
+        return self.cert_engine if self.mcfg.executor == "cert" else self.v6_engine
 
     @property
     def feature_config(self):
-        return self.v6_engine.exec_cfg
+        return self.executor_engine.exec_cfg
 
     @property
     def reuse_state_features(self):
@@ -511,7 +527,8 @@ class ConstrainedMKPPolicy(nn.Module):
     def forward(self, env: MKPEnv, inst: MKPInstances = None, num_samples: int = 1,
                 decode: str = "sample", temperature: float = 1.0, amp: bool = False,
                 pre: Optional[tuple] = None, return_trace: bool = False,
-                theta_override=None, theta_noise: Optional[dict] = None, sigma_override=None):
+                theta_override=None, theta_noise: Optional[dict] = None, sigma_override=None,
+                theta_patch=None, prefix_delta=None):
         """Construct feasible maximal solutions, with one trajectory for primary greedy.
 
         theta_override='fixed' skips the network entirely. A dict supplies explicit
@@ -520,12 +537,15 @@ class ConstrainedMKPPolicy(nn.Module):
         theta_noise samples detached latent actions for a Gaussian score function;
         item choices are always greedy. Step controls refresh every theta_interval.
         """
-        if self.mcfg.executor == "v6":
+        if self.mcfg.executor in ("v6","cert"):
             if inst is None:
-                return self.v6_engine.step_forward(env)
+                return self.executor_engine.step_forward(env)
             if theta_noise is not None or sigma_override is not None:
                 raise ValueError("T8 supports item-PG/PPO only, no theta-noise/SMS stages")
-            return self.v6_engine.episode(inst,num_samples,decode,theta_override,return_trace)
+            if theta_patch is not None or prefix_delta is not None:
+                return self.executor_engine.episode(inst,num_samples,decode,theta_override,return_trace,
+                                                    theta_patch=theta_patch,prefix_delta=prefix_delta)
+            return self.executor_engine.episode(inst,num_samples,decode,theta_override,return_trace)
         if theta_noise is not None:
             if theta_override is not None or self.decoder.mode != "hard_mask" or "alpha" not in self.mcfg.theta_groups:
                 raise ValueError("Theta noise requires learned price/alpha controls and hard_mask")

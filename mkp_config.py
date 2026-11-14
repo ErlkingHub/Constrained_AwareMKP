@@ -82,10 +82,17 @@ class EnvConfig:
 # --------------------------------------------------------------------------------------
 @dataclass
 class ModelConfig:
-    executor: str = "g0g1"             # g0g1 | v6; legacy path unchanged
-    theta_family: str = "g0g1"         # g0g1 | v6
+    executor: str = "g0g1"             # g0g1 | v6 | cert; legacy path unchanged
+    theta_family: str = "g0g1"         # g0g1 | v6 | cert
     ctrl_residual_lp_features: bool = False
     v6_critic: bool = False             # independent critic/feasibility head, T8-B only
+    ctrl_basis_features: bool = False   # T9: five bases + rank/core + global certificate
+    v6_frozen_groups: List[str] = field(default_factory=list)
+    lp_warm_start: bool = False         # reserved; cold solver retained, no speed optimization
+    cert_weights: List[float] = field(default_factory=lambda: [.2]*5)
+    cert_temperature: float = 0.2
+    cert_temperature_min: float = 0.01
+    cert_temperature_max: float = 2.0
     embed_dim: int = 128
     num_heads: int = 8
     ff_mult: int = 4
@@ -194,7 +201,7 @@ class TrainConfig:
 @dataclass
 class EvalConfig:
     mat_file: str = os.path.join("MKP_dataset", "Benchmarks_Chu.mat")
-    dims: List[int] = field(default_factory=lambda: [5, 10])     # add 30 to also test 30-dim
+    dims: List[int] = field(default_factory=lambda: [5, 10, 30]) # full Chu270; training/validation remain M5/10
     sizes: List[int] = field(default_factory=lambda: [100, 250, 500])
     max_instances: int = 0                # 0 = all matching instances
     checkpoint: str = os.path.join("checkpoints", "best.pt")

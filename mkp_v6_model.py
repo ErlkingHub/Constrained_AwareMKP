@@ -16,6 +16,8 @@ from mkp_v6exec import StrategyTheta, WeakDecoder, THETA_STATISTICS
 
 
 def executor_config(cfg):
+    if cfg.lp_warm_start:
+        raise ValueError("Warm start is not implemented: T9 keeps the cold solver and performs no speed optimization")
     return ExecutorConfig(embed_dim=cfg.embed_dim,num_heads=cfg.num_heads,price_floor=cfg.price_floor)
 
 
@@ -84,6 +86,16 @@ class TokenEncoder(nn.Module):
             lp_global=torch.stack(((lp.bound/state.profits.sum(-1)).float(),
                                   (lp.bound/lp.feasible_mass.clamp_min(eps)).float()),-1)
             item_d=torch.cat((item_d,lp_items),-1);res_d=torch.cat((res_d,lp_resources),-1);glob=torch.cat((glob,lp_global),-1)
+        if self.cfg.ctrl_basis_features:
+            from mkp_cert_basis import cert_basis
+            basis=cert_basis(state,exec_cfg);mask=state.feasible
+            per_item=torch.cat((basis.values.clamp(-exec_cfg.feature_clip,exec_cfg.feature_clip),
+                basis.rank[...,None],basis.core[...,None]),-1).float()*mask[...,None]
+            dual_mass=(basis.raw_prices*state.remaining).sum(-1)
+            globals_=torch.stack((dual_mass/basis.dual_value.clamp_min(exec_cfg.eps),
+                lp.certificate_gap/lp.dual_value.clamp_min(exec_cfg.eps),
+                basis.core.sum(-1)/mask.sum(-1).clamp_min(1)),-1).float()
+            item_d=torch.cat((item_d,per_item),-1);glob=torch.cat((glob,globals_),-1)
         return xs,ys,edge_s,item_d,res_d,edge_d,glob,~state.selected
 
     def forward(self,state,exec_cfg):
@@ -147,6 +159,8 @@ class V6Policy(nn.Module):
         super().__init__()
         if cfg.model.theta_family!="v6" or cfg.env.feasibility_mode!="hard_mask" or cfg.model.theta_update!="step" or cfg.model.theta_interval!=1:
             raise ValueError("T8 requires v6 theta, hard mask and every-step controls")
+        if set(cfg.model.v6_frozen_groups)-{'resource_prices','resource_interactions','bottleneck_weight','reserve_weight'}:
+            raise ValueError('v6_frozen_groups only supports the four documented v6c fields')
         self.cfg=cfg;self.exec_cfg=executor_config(cfg.model)
         self.actor=V6Actor(cfg);self.critic=V6Critic(cfg) if cfg.model.v6_critic else None
         self.decoder=WeakDecoder(self.exec_cfg)
@@ -173,6 +187,8 @@ class V6Policy(nn.Module):
 
     def policy(self,state):
         theta,feasibility=self.actor(state)
+        if self.cfg.model.v6_frozen_groups:
+            theta=patch_theta(theta,{n:1. if n=='resource_prices' else 0. for n in self.cfg.model.v6_frozen_groups})
         return self.decoder(state,theta),theta,feasibility
 
     def value(self,state):
@@ -183,7 +199,10 @@ class V6Policy(nn.Module):
         policy,theta,feasibility=self.policy(state)
         return policy,self.value(state),theta,feasibility
 
-    def episode(self,inst,num_samples,decode,override,return_trace):
+    def episode(self,inst,num_samples,decode,override,return_trace,theta_patch=None,prefix_delta=None):
+        if prefix_delta is not None:
+            from mkp_cert_model import prefix_episode
+            return prefix_episode(self,inst,decode,prefix_delta,override,theta_patch,return_trace,num_samples)
         if decode not in ("sample","greedy") or num_samples<1:raise ValueError("Invalid v6 decode")
         p=inst.p.double().repeat_interleave(num_samples,0);w=inst.r.transpose(1,2).double().repeat_interleave(num_samples,0)
         c=inst.c.double().repeat_interleave(num_samples,0)
@@ -193,7 +212,12 @@ class V6Policy(nn.Module):
         for step in range(inst.N):
             active=state.active
             if not bool(active.any()):break
-            if override is None:policy,theta,_=self.policy(state)
+            if override is None:
+                if theta_patch is None:policy,theta,_=self.policy(state)
+                else:
+                    theta,_=self.actor(state)
+                    if self.cfg.model.v6_frozen_groups:
+                        theta=patch_theta(theta,{n:1. if n=='resource_prices' else 0. for n in self.cfg.model.v6_frozen_groups})
             else:
                 if isinstance(override,str):
                     if override!="fixed":raise ValueError("Only fixed v6 override is supported")
@@ -202,6 +226,11 @@ class V6Policy(nn.Module):
                     values={n:torch.as_tensor(v,device=p.device,dtype=torch.float32) for n,v in override.items()}
                     theta=StrategyTheta(**{n:v.expand(len(p),*v.shape[1:]) if len(v)==1 else v.repeat_interleave(num_samples,0) for n,v in values.items()})
                 policy=self.decoder(state,theta)
+            if override is not None and self.cfg.model.v6_frozen_groups:
+                theta=patch_theta(theta,{n:1. if n=='resource_prices' else 0. for n in self.cfg.model.v6_frozen_groups})
+                policy=self.decoder(state,theta)
+            if theta_patch is not None:
+                theta=patch_theta(theta,theta_patch);policy=self.decoder(state,theta)
             action=policy.choose(stochastic=decode=="sample")
             logp=logp+policy.log_prob(action)*active
             # A follows the new project's item-PG raw categorical entropy;
@@ -220,3 +249,12 @@ class V6Policy(nn.Module):
             "n_reject":torch.zeros(len(p),device=p.device),"steps":len(sequence),
             "sequence":torch.stack(sequence,1) if sequence else torch.empty(len(p),0,dtype=torch.long,device=p.device),"trace":trace,
             "theta_statistics":dict(zip(THETA_STATISTICS,(stat_sum/max(stat_count,1)).tolist()))}
+
+
+def patch_theta(theta,patch):
+    values={n:getattr(theta,n) for n in theta.__dataclass_fields__}
+    for name,value in patch.items():
+        if name not in values:raise ValueError(f"Unknown theta field: {name}")
+        value=torch.as_tensor(value,device=values[name].device,dtype=values[name].dtype)
+        values[name]=value.expand_as(values[name])
+    return StrategyTheta(**values)

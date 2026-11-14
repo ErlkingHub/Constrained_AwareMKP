@@ -61,6 +61,9 @@ def _check_checkpoint(ck, expected_model=None):
     model_cfg.setdefault("theta_family", "g0g1")
     model_cfg.setdefault("ctrl_residual_lp_features", False)
     model_cfg.setdefault("v6_critic", False)
+    for name,default in (("ctrl_basis_features",False),("v6_frozen_groups",[]),("lp_warm_start",False),
+                         ("cert_weights",[.2]*5),("cert_temperature",.2),("cert_temperature_min",.01),("cert_temperature_max",2.)):
+        model_cfg.setdefault(name,default)
     legacy = {"residual_max", "primitives", "init_primitive", "init_primitive_logit",
               "kappa_init", "kappa_min", "price_log_range"}.intersection(model_cfg)
     legacy_weights = any(any(part in key for part in ("res_head", "prim_head", "kappa_head"))
@@ -141,7 +144,7 @@ class _CSVLogger:
 
 class MKPTrainer:
     def __init__(self, cfg: Config, device: torch.device):
-        if cfg.model.executor == "v6":
+        if cfg.model.executor in ("v6","cert"):
             raise ValueError("Use the T8 trainer/launcher for the v6 executor")
         self.cfg, self.device = cfg, device
         tc = cfg.train

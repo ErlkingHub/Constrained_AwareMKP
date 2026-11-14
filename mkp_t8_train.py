@@ -16,6 +16,7 @@ import mkp_v6_lp as lp
 import mkp_v6_ranking as ranking
 
 SCHEMA="weak_decoder_t8_v6_v1"
+CERT_SCHEMA="weak_decoder_t9_cert_v1"
 
 
 def data_tuple(inst):
@@ -31,8 +32,11 @@ def save_csv(path,rows):
 class T8Trainer:
     def __init__(self,cfg,device):
         self.cfg,self.device=cfg,device;tc=cfg.train
-        if cfg.model.executor!="v6" or tc.signal not in ("item_pg","ppo_gae") or cfg.model.v6_critic!=(tc.signal=="ppo_gae"):
+        if cfg.model.executor=="cert" and (tc.signal!="item_pg" or cfg.model.v6_critic):
+            raise ValueError("T9 cert supports item_pg only; no PPO/critic or v6 retraining")
+        if cfg.model.executor not in ("v6","cert") or tc.signal not in ("item_pg","ppo_gae") or cfg.model.v6_critic!=(tc.signal=="ppo_gae"):
             raise ValueError("T8-A=item_pg/no critic; T8-B=ppo_gae/independent critic")
+        if cfg.model.executor=="cert" and tc.signal!="item_pg":raise ValueError("T9 cert supports item_pg only; no PPO or v6 retraining")
         if tc.resume or tc.init_from:raise ValueError("T8 starts fresh; implicit resume/warm-start is disabled")
         self.model=build_model(cfg).to(device)
         self.optimizer=torch.optim.AdamW(self.model.parameters(),lr=tc.lr,weight_decay=0.)
@@ -107,24 +111,33 @@ class T8Trainer:
 
     def checkpoint(self,name):
         path=self.checkpoints/name
-        torch.save({"schema":SCHEMA,"config":self.cfg.to_dict(),"executor_config":asdict(self.model.v6_engine.exec_cfg),
+        torch.save({"schema":CERT_SCHEMA if self.cfg.model.executor=="cert" else SCHEMA,"config":self.cfg.to_dict(),"executor_config":asdict(self.model.executor_engine.exec_cfg),
             "model":self.model.state_dict(),"optimizer":self.optimizer.state_dict(),"update":self.step,
             "best_validation_gap":self.best,"selection":"fixed synthetic N100 MILP-reference single-greedy mean gap; ties keep earlier",
             "training_data_source":"synthetic_only"},path)
 
     def fit(self):
         tc=self.cfg.train
+        if self.cfg.model.executor=="cert" and not getattr(self,'gate_provenance',None):
+            raise ValueError('Formal cert training requires scripts/run_t9.py with completed gates and explicit decision')
         if self.run.exists() or self.checkpoints.exists():raise FileExistsError("Preserve existing T8 run/checkpoint")
         self.run.mkdir(parents=True);self.checkpoints.mkdir(parents=True)
         self.cfg.save(str(self.run/"config.json"))
         meta={"schema":"t8_training_v1","status":"running","source":source_provenance(),"config":self.cfg.to_dict(),
-            "recipe":asdict(self.recipe),"device":str(self.device),"selection":"fixed synthetic N100 greedy gap only; no Chu checkpoint selection",
+            "recipe":asdict(self.recipe) if self.cfg.model.executor=='v6' else {
+                'signal':'item_pg','num_samples':tc.num_samples,'entropy_coef':tc.entropy_coef,'learning_rate':tc.lr,
+                'grad_clip':tc.grad_clip,'baseline':'same-instance shared mean','reward':'terminal profit/root UB','critic':False,'shaping':False},
+            "device":str(self.device),"selection":"fixed synthetic N100 greedy gap only; no Chu checkpoint selection",
             "boundaries":"Ranking continuations are training-only frozen-policy labels, never PPO buffer/critic targets. "
                          "Inference is one greedy episode, with neither critic nor feasibility head.",
             "A_diagnostics":"R_mean/frac_better: pre-update greedy training-batch diagnostic every log_every; never a baseline/target",
             "reduction_rule":"At update250: if projected total>24h, A B64->32; B ranking_states16->8. Record actual budgets.",
             "runtime":"v6 float64 geometry/fp32 scores; new dual-axis controller. No memory24 geometry bank; state LP memo shared.",
             "validation":[],"reductions":[]}
+        if self.cfg.model.executor=='cert':
+            meta.update(schema='t9_cert_training_v1',gate_provenance=self.gate_provenance,
+                runtime='float64 physical state/LP/cert bases, fp32 heads/scores; state-local LP/basis memo; cold solver, no AMP or speed optimization',
+                boundaries='New cert-only training; no v6/v6c retraining, critic, shaping or continuation ranking. Inference is one greedy trajectory.')
         # Rebase recipe path fields before JSON serialization, no legacy paths.
         meta["recipe"]={k:str(v) if isinstance(v,Path) else v for k,v in meta["recipe"].items()}
         write_json(self.run/"meta.json",meta)

@@ -4,7 +4,6 @@ Run D_port/G_port first, then reuse --port_reference for trained best/last arms.
 All historical rows must match instance bytes and reference definitions.
 """
 import argparse
-from collections import Counter
 from dataclasses import asdict
 import json
 from pathlib import Path
@@ -20,56 +19,10 @@ from mkp_env import MKPEnv, MKPInstances
 from mkp_Model import build_model
 from mkp_t8_train import SCHEMA
 import mkp_v6_lp as lp
-from read_mat import read_mat
 from scripts.run_t8 import configuration
-from scripts.t5_export_instances import export_data_sha256
 from scripts.t5_report import read_jsonl
 from scripts.t8_report import report
-
-
-def datasets(source, historical, smoke):
-    """Use exact T5 bytes; historical rows provide strata, never objectives here."""
-    index = {(r['dataset'], str(r['id'])): r for r in historical if r['arm'] == 'L'}
-    records = []
-    for row in read_mat(resolve_path('MKP_dataset/Benchmarks_Chu.mat')):
-        if row['M'] not in (5, 10) or row['N'] not in (100, 250, 500):
-            continue
-        p = row['P'].reshape(-1); c = row['B'].reshape(-1)
-        w = row['R'].reshape(row['M'], row['N']).T.copy()
-        old = index[('chu', str(row['id']))]
-        if float(row['best']) != old['reference']:
-            raise ValueError('Chu reference changed')
-        records.append(({**old}, p, w, c))
-    manifest = json.loads((source / 'manifest.json').read_text(encoding='utf-8'))
-    bundle = source / 'instances_eval.npz'
-    if manifest['status'] != 'complete' or sha256_file(bundle) != manifest['bundles']['eval']['sha256']:
-        raise ValueError('Invalid T5 export manifest/bundle')
-    with np.load(bundle, allow_pickle=False) as archive:
-        metadata = json.loads(str(archive['metadata'].item()))
-        if metadata['schema'] != 't5_instance_bundle_v1' or metadata['smoke_only']:
-            raise ValueError('T8 requires the formal frozen T5 bundle even for smoke')
-        for i, record in enumerate(metadata['records']):
-            old = index[('synthetic_N100', str(record['id']))]
-            if any(record[n] != old[n] for n in ('reference', 'reference_kind', 'reference_proven', 'data_sha256')):
-                raise ValueError('Synthetic T5 references changed')
-            records.append(({**old}, *(archive[f'{n}_{i}'].copy() for n in ('p', 'w', 'c'))))
-    counts = Counter()
-    for meta, p, w, c in records:
-        if export_data_sha256(p, w, c) != meta['data_sha256']:
-            raise ValueError(f"T5 instance hash mismatch: {meta['dataset']}/{meta['id']}")
-        if p.shape != (meta['N'],) or w.shape != (meta['N'], meta['M']) or c.shape != (meta['M'],):
-            raise ValueError('Instance shape mismatch')
-        counts[meta['dataset']] += 1
-    if counts != {'chu': 180, 'synthetic_N100': 128}:
-        raise ValueError(f'Incomplete formal data: {counts}')
-    if smoke:
-        kept, seen = [], set()
-        for record in records:
-            key = record[0]['dataset'], record[0]['M']
-            if key not in seen:
-                seen.add(key); kept.append(record)
-        return kept
-    return records
+from scripts.t8_data import datasets, pending_records, validate_rows
 
 
 class Timings:
@@ -137,8 +90,8 @@ def main(argv=None):
     parser.add_argument('--tag', choices=('best', 'last'), default='best')
     parser.add_argument('--device', default='cuda:0')
     parser.add_argument('--threads', type=int, default=2)
-    parser.add_argument('--limit', type=int, choices=(0, 2), default=0, help='2 = engineering smoke: one per M per dataset')
-    parser.add_argument('--output', default='results/t8_port')
+    parser.add_argument('--limit', type=int, choices=(0, 2), default=0, help='2 = one per M: Chu3 + synthetic2 engineering smoke')
+    parser.add_argument('--output', default='results/t8_port_270')
     args = parser.parse_args(argv)
     if len(set(args.arms)) != len(args.arms):
         raise ValueError('Duplicate arm')
@@ -150,14 +103,22 @@ def main(argv=None):
         raise ValueError('T5 measured reference rows changed or incomplete')
     records = datasets(source, historical, bool(args.limit))
     means_path = history_dir / 'theta_means.json'; means = json.loads(means_path.read_text(encoding='utf-8'))
+    g_dims = {int(m) for m in means['G']}
+    if not {5, 10} <= g_dims:
+        raise ValueError('T5 G requires both M5 and M10 constants')
     dest = Path(resolve_path(args.output))
     if dest.exists():
         raise FileExistsError(f'Preserve existing T8 evaluation: {dest}')
     dest.mkdir(parents=True)
     device = torch.device(args.device); torch.set_num_threads(args.threads); torch.manual_seed(1234)
-    meta = {'schema': 't8_evaluation_v1', 'status': 'running', 'smoke_only': bool(args.limit), 'tag': args.tag,
+    meta = {'schema': 't8_evaluation_v2_chu270', 'status': 'running', 'smoke_only': bool(args.limit), 'tag': args.tag,
         'source': source_provenance(), 'arguments': vars(args), 'arms': {}, 'historical_rows_sha256': sha256_file(history_path),
         'theta_means_sha256': sha256_file(means_path), 'bundle_sha256': sha256_file(source / 'instances_eval.npz'),
+        'coverage': {'chu_dims': [5, 10, 30], 'chu_sizes': [100, 250, 500], 'formal_chu_cases': 270,
+            'selected_chu_cases': sum(r[0]['dataset']=='chu' for r in records),
+            'selected_synthetic_cases': sum(r[0]['dataset']=='synthetic_N100' for r in records),
+            'G_available_dims': sorted(g_dims), 'missing_G_dims': sorted({5,10,30}-g_dims),
+            'historical_comparisons': 'matched instance intersection only; T5 currently covers Chu M5/M10'},
         'scope': 'one greedy; historical L_v6 and F0 quoted; no sampling/search; no critic or feasibility inference',
         'timing': 'synchronized instrumented wall seconds; total includes traces; controller excludes LP nested inside actor; timings are not matched to historical hardware'}
     rows, traces = [], []
@@ -172,19 +133,30 @@ def main(argv=None):
         if sha256_file(prior / 'rows.jsonl') != pm['rows_sha256']:
             raise ValueError('Port reference rows changed')
         rows.extend(r for r in reused if r['arm'] in ('D_port', 'G_port'))
-        if {r['arm'] for r in rows} != {'D_port', 'G_port'} or {'D_port', 'G_port'} & set(args.arms):
-            raise ValueError('Reference must supply exactly the two baseline arms without duplicate re-evaluation')
+        if {r['arm'] for r in rows} != {'D_port', 'G_port'}:
+            raise ValueError('Reference must supply both baseline arms')
+        validate_rows(rows, records, g_dims, complete=False)
         meta['port_reference'] = {'path': str(prior), 'meta_sha256': sha256_file(prior / 'meta.json')}
     if {'A', 'B'} & set(args.arms) and not args.port_reference and not {'D_port', 'G_port'} <= set(args.arms):
         raise ValueError('Trained comparisons require both D/G baselines or --port_reference')
     write_json(dest / 'meta.json', meta)
+    # Old Chu180 baselines are valid reusable rows. Fill missing M30 D episodes
+    # before A/B, while G remains restricted to the dimensions with real theta.
+    planned_arms = (['D_port', 'G_port'] if args.port_reference else []) + args.arms
+    planned_arms = [a for a in ('D_port','G_port','A','B') if a in planned_arms]
+    print(f"Chu270 M5/M10/M30; G constants available for M={sorted(g_dims)}. Historical comparisons use matched cases only.", flush=True)
     try:
         with (dest / 'rows.jsonl').open('w', encoding='utf-8') as outcomes, (dest / 'traces.jsonl').open('w', encoding='utf-8') as trace_file:
             for r in rows:
                 outcomes.write(json.dumps(r) + '\n')
-            for arm in args.arms:
+            for arm in planned_arms:
+                pending = pending_records(records, arm, g_dims, rows)
+                meta['arms'][arm] = {'reused_rows': sum(r['arm']==arm for r in rows), 'new_rows': len(pending)}
+                if not pending:
+                    continue
                 model, provenance = load_arm(arm, args, device); meta['arms'][arm] = provenance
-                for info, p, w, c in records:
+                meta['arms'][arm].update(reused_rows=sum(r['arm']==arm for r in rows), new_rows=len(pending))
+                for info, p, w, c in pending:
                     inst = MKPInstances(torch.tensor(p, device=device).unsqueeze(0), torch.tensor(w.T.copy(), device=device).unsqueeze(0), torch.tensor(c, device=device).unsqueeze(0))
                     override = means['G'][str(info['M'])] if arm == 'G_port' else None
                     with torch.no_grad(), Timings(model, device) as timing:
@@ -212,9 +184,9 @@ def main(argv=None):
                 del model
                 if arm == 'G_port' and {'A', 'B'} & set(args.arms):
                     # Fail port reproduction before spending on learned-arm runs.
-                    report(dest, rows, [], historical, bool(args.limit))
+                    report(dest, rows, [], historical, bool(args.limit), records, g_dims)
         meta['rows_sha256'] = sha256_file(dest / 'rows.jsonl')
-        report(dest, rows, traces, historical, bool(args.limit))
+        report(dest, rows, traces, historical, bool(args.limit), records, g_dims)
         meta['status'] = 'complete'
     except Exception as exc:
         meta.update(status='failed', error=repr(exc)); raise
