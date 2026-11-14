@@ -42,6 +42,7 @@ class DeviceConfig:
     # bf16 autocast for the attention stacks (env / decoder / rewards always stay fp32).
     amp: bool = True
     seed: int = 1234
+    lp_backend: str = "eager"          # eager | cuda_graph; unchanged cold FP64 LP arithmetic
 
 
 # --------------------------------------------------------------------------------------

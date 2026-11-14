@@ -57,7 +57,7 @@ def _smoothed_dual(y, profits, loads, feasible, tau):
 
 
 @torch.no_grad()
-def solve_lp_relaxation(state, config):
+def _solve_lp_eager(state, config, *, _linear_solve=None, _steps=None):
     eps = config.eps
     feasible = state.feasible
     mask = feasible.double()
@@ -70,7 +70,8 @@ def solve_lp_relaxation(state, config):
     loads = w / rem[:, None].clamp_min(eps) * mask[..., None]
     b, m = rem.shape
     y = rem.new_zeros(b, m)
-    steps = _STEPS.to(rem)
+    steps = _STEPS.to(rem) if _steps is None else _steps
+    linear_solve = torch.linalg.solve if _linear_solve is None else _linear_solve
     eye = torch.eye(m, dtype=rem.dtype, device=rem.device)
     for tau in config.lp_temperatures:
         for _ in range(config.lp_newton_steps):
@@ -85,7 +86,7 @@ def solve_lp_relaxation(state, config):
             damping = 1e-9 + 1e-7 * hessian.diagonal(dim1=1, dim2=2).mean(-1)
             system = torch.where(pair, hessian, torch.zeros_like(hessian)) + eye * damping[:, None, None]
             system = system + torch.diag_embed((~free).to(rem.dtype))
-            direction = torch.linalg.solve(system, (gradient * free)[..., None]).squeeze(-1)
+            direction = linear_solve(system, (gradient * free)[..., None]).squeeze(-1)
             # Trust region: a flat Hessian (all items far from the boundary) cannot jump far.
             radius = y.amax(-1, keepdim=True).clamp_min(1.0)
             direction = direction * (radius / direction.abs().amax(-1, keepdim=True).clamp_min(1e-30)).clamp_max(1)
@@ -109,6 +110,11 @@ def solve_lp_relaxation(state, config):
     return LPRelaxation(primal.float(), (reduced * mask).float(), y.float(),
                         (1 - usage).clamp(0, 1).float(), share.float(), bound, mass,
                         dual_value, primal_value, (dual_value-primal_value).clamp_min(0), scale, raw_prices)
+
+
+def solve_lp_relaxation(state, config):
+    from mkp_lp_runtime import execute
+    return execute(state,config,_solve_lp_eager)
 
 
 def lp_relaxation(state, config):

@@ -15,13 +15,16 @@ from scripts.t5_report import read_jsonl,write_csv
 from scripts.eval_t8 import Timings
 from scripts.run_t9_measure import exact_lp,identity_parts,selected
 from scripts.t9_report import evaluation_report
+import mkp_lp_runtime
 
 
 def main():
     p=parser(__doc__,'results/t9_best_270');p.add_argument('--dictionary',default='results/t9_dictionary')
     p.add_argument('--arms',nargs='+',choices=('D_cert','K*','T9-A'),default=['D_cert','K*','T9-A'])
     p.add_argument('--checkpoint',default='checkpoints/t9_a_cert_s1234/best.pt');p.add_argument('--tag',choices=('best','last'),default='best')
+    p.add_argument('--lp_backend',choices=('eager','cuda_graph'),default='eager')
     a=p.parse_args();torch.set_num_threads(2);device=torch.device(a.device)
+    mkp_lp_runtime.set_backend(a.lp_backend)
     if len(a.arms)!=len(set(a.arms)):raise ValueError('Duplicate arm')
     records,baselines,root=context(a);dictionary=Path(resolve_path(a.dictionary));c=json.loads((dictionary/'calibration.json').read_text())
     if c['smoke_only'] and not a.limit:raise ValueError('Formal evaluation requires formal calibration')
@@ -42,6 +45,7 @@ def main():
                     meta['checkpoint_sha256']=sha256_file(path)
                     meta['checkpoint_update']=checkpoint['update']
                 else:model=build_model(cfg)
+                cfg.device.lp_backend=a.lp_backend
                 meta['models'][arm]=cfg.to_dict()
                 model=model.to(device).eval()
                 for record in records:
@@ -71,7 +75,7 @@ def main():
         write_csv(dest/'gap_identity.csv',identities)
         meta.update(status='complete',rows_sha256=sha256_file(dest/'rows.jsonl'))
     except Exception as exc:meta.update(status='failed',error=repr(exc));raise
-    finally:write_json(dest/'meta.json',meta)
+    finally:meta['LP_runtime']=mkp_lp_runtime.statistics();write_json(dest/'meta.json',meta)
 
 
 if __name__=='__main__':main()

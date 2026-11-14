@@ -1,5 +1,6 @@
-"""Measure a few complete cert updates, then project the unchanged T8-A budget.
-No formal run/checkpoint is created. No optimizer/LP speed optimization is applied.
+"""Measure complete cert updates and project the unchanged training budget.
+No formal run/checkpoint is created. Optional LP execution acceleration only;
+the optimizer, precision, solver schedule and training recipe remain unchanged.
 """
 import argparse,json,sys,time
 from pathlib import Path
@@ -30,21 +31,26 @@ def main():
     p.add_argument('--batches',nargs='+',type=int,default=[64,32]);p.add_argument('--repeats',type=int,default=1)
     p.add_argument('--sizes',nargs='+',type=int,default=[50,100,150]);p.add_argument('--dims',nargs='+',type=int,default=[5,10]);p.add_argument('--limit',type=int,default=0)
     p.add_argument('--calibration',help='optional final calibration.json; re-profile after formal gate selection')
+    p.add_argument('--lp_backend',choices=('eager','cuda_graph'),default='eager')
     a=p.parse_args();dest,meta=fresh(a.output,a);device=torch.device(a.device);torch.set_num_threads(2);rows=[]
     meta.update(device=str(device),GPU=torch.cuda.get_device_name(device) if device.type=='cuda' else None,
+        torch_version=torch.__version__,cuda_version=torch.version.cuda,
         scope='isolated profiling updates only; no fit, validation selection or formal checkpoint',config=cert_config(a.calibration).to_dict(),
         calibration_sha256=sha256_file(a.calibration) if a.calibration else None)
+    meta['config']['device']['lp_backend']=a.lp_backend
     write_json(dest/'meta.json',meta)
     try:
         for batch in a.batches:
             for m in a.dims:
                 for n in a.sizes:
-                    set_seed(1234);cfg=cert_config(a.calibration);cfg.train.batch_size=batch
+                    set_seed(1234);cfg=cert_config(a.calibration);cfg.train.batch_size=batch;cfg.device.lp_backend=a.lp_backend
                     trainer=T8Trainer(cfg,device);trainer.step=1 # measure primary update; greedy diagnostics separately estimated below
                     inst=generate_instances(batch,n,m,generator=torch.Generator().manual_seed(910000+n+m)).to(device)
                     for repeat in range(a.repeats):
                         sync(device);tick=time.perf_counter();stats=trainer.update(inst);sync(device);elapsed=time.perf_counter()-tick
                         row=dict(batch=batch,M=m,N=n,repeat=repeat,seconds=elapsed,trajectories=batch*16)
+                        from mkp_lp_runtime import statistics
+                        row['lp_backend']=a.lp_backend;row['graph_captures']=statistics().get('captures',0)
                         rows.append(row);write_csv(dest/'updates.csv',rows)
                         print(json.dumps(row),flush=True)
                     del trainer,inst
@@ -56,6 +62,8 @@ def main():
                 engineering_range_hours=[seconds/3600,seconds/3600*1.25],
                 limitations='one generated batch per shape, weights near initialization; 0-25% allowance for diagnostics/validation/I/O/drift, not a confidence interval. No full-run measurement.')
         meta.update(status='complete',mean_seconds_per_update=estimates)
+        from mkp_lp_runtime import statistics
+        meta['LP_runtime']=statistics()
     except Exception as exc:meta.update(status='failed',error=repr(exc));raise
     finally:write_json(dest/'meta.json',meta)
 

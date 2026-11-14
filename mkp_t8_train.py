@@ -14,6 +14,7 @@ from mkp_v6_config import TrainConfig as V6Recipe
 from mkp_v6_ppo import collect_rollout,PPOUpdate
 import mkp_v6_lp as lp
 import mkp_v6_ranking as ranking
+import mkp_lp_runtime as lp_runtime
 
 SCHEMA="weak_decoder_t8_v6_v1"
 CERT_SCHEMA="weak_decoder_t9_cert_v1"
@@ -32,6 +33,8 @@ def save_csv(path,rows):
 class T8Trainer:
     def __init__(self,cfg,device):
         self.cfg,self.device=cfg,device;tc=cfg.train
+        from mkp_lp_runtime import set_backend
+        set_backend(cfg.device.lp_backend)
         if cfg.model.executor=="cert" and (tc.signal!="item_pg" or cfg.model.v6_critic):
             raise ValueError("T9 cert supports item_pg only; no PPO/critic or v6 retraining")
         if cfg.model.executor not in ("v6","cert") or tc.signal not in ("item_pg","ppo_gae") or cfg.model.v6_critic!=(tc.signal=="ppo_gae"):
@@ -136,7 +139,7 @@ class T8Trainer:
             "validation":[],"reductions":[]}
         if self.cfg.model.executor=='cert':
             meta.update(schema='t9_cert_training_v1',gate_provenance=self.gate_provenance,
-                runtime='float64 physical state/LP/cert bases, fp32 heads/scores; state-local LP/basis memo; cold solver, no AMP or speed optimization',
+                runtime='float64 physical state/LP/cert bases, fp32 heads/scores; state-local LP/basis memo; unchanged cold solver and training recipe; optional execution backend in LP_runtime',
                 boundaries='New cert-only training; no v6/v6c retraining, critic, shaping or continuation ranking. Inference is one greedy trajectory.')
         # Rebase recipe path fields before JSON serialization, no legacy paths.
         meta["recipe"]={k:str(v) if isinstance(v,Path) else v for k,v in meta["recipe"].items()}
@@ -186,6 +189,7 @@ class T8Trainer:
                 if self.step%tc.log_every==0 or self.step==1:
                     save_csv(self.run/"train_log.csv",self.rows)
                     meta.update(actual_updates=self.step,actual_config=self.cfg.to_dict(),primary_trajectories=self.primary_trajectories,
+                        LP_runtime=lp_runtime.statistics(),
                         diagnostic_trajectories=self.diagnostic_trajectories,validation_trajectories=validation_trajectories,
                         ranking_trajectories=ranking.CONTINUATION_TRAJECTORIES-start_rank,
                         LP_batch_solves=lp.LP_SOLVE_BATCHES-start_lp[0],LP_state_solves_including_padding=lp.LP_SOLVE_STATES-start_lp[1],
@@ -197,6 +201,7 @@ class T8Trainer:
         except (Exception,KeyboardInterrupt) as exc:meta.update(status="failed",error=repr(exc));raise
         finally:
             meta.update(actual_updates=self.step,actual_config=self.cfg.to_dict(),primary_trajectories=self.primary_trajectories,
+                LP_runtime=lp_runtime.statistics(),
                 diagnostic_trajectories=self.diagnostic_trajectories,validation_trajectories=validation_trajectories,
                 ranking_trajectories=ranking.CONTINUATION_TRAJECTORIES-start_rank,
                 ranking_diagnostic_trajectories=self.ranking_diagnostic_trajectories,
