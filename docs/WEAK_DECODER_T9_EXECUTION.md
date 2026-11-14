@@ -2,7 +2,9 @@
 
 日期：2026-11-14。依据 [RESEARCH_HANDOFF_TO_CODEX.md](RESEARCH_HANDOFF_TO_CODEX.md)。分支 `codex/t9-new_theta-certified-core`，指导与进展快照提交 `c783526`，代码提交 `cf5f4d5`；本说明另作 docs 提交。
 
-用户补充优先：**新训练只做 cert，不重训 v6/v6c；以后完整评估均为 Chu270；先估算训练时间，暂不优化训练速度。** v6 仅作为既有 checkpoint、固定参照和离线接口探针。T9-5 的 beam、多轨迹推理等搜索未准备、未运行。
+用户补充优先：**新训练只做 cert，不重训 v6/v6c；以后完整评估均为 Chu270。** 初版按“先估算训练时间，暂不优化训练速度”执行，后续授权见下一段。v6 仅作为既有 checkpoint、固定参照和离线接口探针。T9-5 的 beam、多轨迹推理等搜索未准备、未运行。
+
+后续用户已授权保持训练逻辑的速度优化。可选CUDA Graph后端、约18–23小时的新估计及4090服务器命令见 [训练执行加速说明](T9_TRAINING_PERFORMANCE.md)；下文34–42小时是原eager后端的初始计时，不再作为加速模式的估计。
 
 ## 1. 实施范围
 
@@ -18,7 +20,7 @@
 | `scripts/run_t9_measure.py` | T9-0 的精确 LP、I1 分解、core 诊断、冻结组；T9-4 的 prefix 诊断。HiGHS 整数解只出现在参考/诊断中 |
 | `scripts/t9_interface.py`、`scripts/run_t9_dictionary.py` | 合成校准、固定臂、移植执行器的分数探针、随机基对照、按顺序尝试/拒绝扩展、oracle 和两种 ρ 分母 |
 | `scripts/run_t9.py`、`scripts/eval_t9.py`、`scripts/t9_report.py` | cert 配置、门控训练入口、Chu270 greedy 评测和配对/动态 θ/I1 报告 |
-| `scripts/profile_t9.py` | 少量完整更新的计时外推，不建立正式 run，不做速度优化 |
+| `scripts/profile_t9.py` | 少量完整更新的计时外推，不建立正式 run；可对比 eager/cuda_graph 执行后端 |
 | `scripts/t9_common.py`、`tests/test_t9_cert.py` | 数据/参考值校验、报告公用逻辑，以及指导要求的五项测试 |
 
 保留并提交上一轮尚未提交的 `scripts/t8_data.py`、`tests/test_t8_coverage.py`、评估/README/说明修改；T9 没有再次改写 `eval_t8.py` 的主流程。T9 直接复用 Chu270 数据读取与旧 T5 合成128交换文件。

@@ -1,6 +1,8 @@
 # Constrained_AwareMKP
 
-> 2026-11-14 T9: [Compact cert theta, LP certificates, gates and runtime estimate](docs/WEAK_DECODER_T9_EXECUTION.md). New training is cert-only; no v6/v6c retraining. All headline arms use Chu270. Formal gates precede training; preliminary timing projects about 34–42 hours with the unchanged T8-A budget rule. No training-speed optimization applied.
+> 2026-11-14 performance update: [Optional CUDA Graph LP backend and server commands](docs/T9_TRAINING_PERFORMANCE.md). Same cold FP64 solve and training recipe; tested LP/actions/RNG/gradient parity. Full-update timing projects about 18–23 hours on the local GPU. Formal gates and Chu270 coverage remain unchanged.
+
+> 2026-11-14 T9: [Compact cert theta, LP certificates, gates and runtime estimate](docs/WEAK_DECODER_T9_EXECUTION.md). New training is cert-only; no v6/v6c retraining. All headline arms use Chu270. Formal gates precede training; the initial eager-backend estimate was 34–42 hours with the unchanged T8-A budget rule. See the performance update above for the optional accelerated backend.
 
 > 2026-11-13: [Chu270 evaluation and reuse of existing Chu180 baselines](docs/WEAK_DECODER_T8_EXECUTION.md). D/A/B cover M5/M10/M30; G/L comparisons retain their matched historical subset. Training and validation remain M5/M10.
 
